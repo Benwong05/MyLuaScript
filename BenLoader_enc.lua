@@ -5,7 +5,7 @@
 --  registered; the other one never starts. To switch to the other
 --  script later, reload this file and pick again.
 --
---  All three menus (this loader, Auto Super Broadcast, Vend Helper)
+--  All the menus (this loader, Auto Super Broadcast, Vend Helper, Auto Geiger, Auto Crystal)
 --  share the SAME theme/widget helpers below, so they all look and
 --  behave the same way.
 --====================================================
@@ -2638,11 +2638,637 @@ say("`2[Auto Geiger] loaded." .. (S.cfgPath and " Config loaded." or ""))
 
 end  -- startGeiger
 
+local function startAutoCrystal()
+--====================================================
+--  AUTO CRYSTAL COMBINE
+--  Stand on (or set) your combiner tile, pick a recipe, press START.
+--  Places the crystals in order, punches, waits for the result, and
+--  loops until the amount is done or you run out of crystals.
+--====================================================
+
+---------------- RECIPES (from your screenshot) ----------------
+-- R=red 2242, G=green 2244, B=blue 2246, W=white 2248, K=black 2250
+local CRYSTAL = { R = 2242, G = 2244, B = 2246, W = 2248, K = 2250, FIST = 18 }
+local COLOR_ORDER = { "R", "G", "B", "W", "K" }        -- place order: red, green, blue, white, black
+local COLOR_NAME  = { R = "Red", G = "Green", B = "Blue", W = "White", K = "Black" }
+
+local RECIPES = {
+    { name = "Crystal Tree",            amt = 3,  R = 0, G = 2, B = 3, W = 0, K = 0 },
+    { name = "Crystal Spikes",          amt = 5,  R = 2, G = 0, B = 3, W = 0, K = 0 },
+    { name = "Crystal Clock",           amt = 1,  R = 0, G = 2, B = 1, W = 2, K = 0 },
+    { name = "Crystal Gate",            amt = 1,  R = 3, G = 0, B = 1, W = 1, K = 0 },
+    { name = "Stained Glass",           amt = 10, R = 1, G = 2, B = 2, W = 0, K = 0 },
+    { name = "Shifty Block",            amt = 5,  R = 2, G = 1, B = 1, W = 1, K = 0 },
+    { name = "Sapphire Block",          amt = 1,  R = 0, G = 0, B = 5, W = 0, K = 0 },
+    { name = "Yellow Diamond",          amt = 1,  R = 2, G = 2, B = 0, W = 1, K = 0 },
+    { name = "Steam Lamp",              amt = 3,  R = 2, G = 2, B = 1, W = 0, K = 0 },
+    { name = "Gilded Frame",            amt = 20, R = 3, G = 2, B = 0, W = 0, K = 0 },
+    { name = "Golden Cave Crystal",     amt = 1,  R = 2, G = 2, B = 0, W = 0, K = 1 },
+    { name = "Amethyst Block",          amt = 1,  R = 2, G = 0, B = 2, W = 0, K = 1 },
+    { name = "Plasma Globe",            amt = 1,  R = 2, G = 1, B = 0, W = 2, K = 0 },
+    { name = "Harmonic Chimes",         amt = 1,  R = 1, G = 0, B = 2, W = 2, K = 0 },
+    { name = "Celestial Kaleidoscope",  amt = 1,  R = 1, G = 1, B = 1, W = 2, K = 0 },
+    { name = "Kaleidoscopic Wallpaper", amt = 10, R = 1, G = 2, B = 1, W = 1, K = 0 },
+    { name = "Demon Crystal",           amt = 1,  R = 3, G = 1, B = 0, W = 0, K = 1 },
+}
+
+---------------- SETTINGS ----------------
+local cfg = {
+    combineX = 0, combineY = 0,     -- the tile you stand on / place into / punch
+    recipe   = 6,                   -- index into RECIPES
+    amount   = 0,                   -- how many combines to do (0 = infinite, until you run out of crystals)
+    placeDelayMs  = 450,            -- gap between placing each crystal
+    confirmWaitMs = 4000,           -- how long to wait for "highest vibration" before punching anyway
+    punchWaitMs   = 2500,           -- how long to wait for a result after punching
+    punchRetries  = 2,              -- extra punches if the first doesn't seem to land
+    cycleGapMs    = 600,            -- pause between one combine finishing and the next starting
+}
+
+local CONFIG_PATHS = { "autocrystal_config.txt", "scripts/autocrystal_config.txt", "/sdcard/autocrystal_config.txt" }
+local SAVE_KEYS = { "combineX", "combineY", "recipe", "amount", "placeDelayMs", "confirmWaitMs",
+                    "punchWaitMs", "punchRetries", "cycleGapMs" }
+local SAVE_SET = {}
+for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
+
+---------------- STATE ----------------
+local S = {
+    running     = false,
+    threadAlive = false,
+    stage       = "Idle",
+    stageCol    = C.white,
+    cycles      = 0,                -- successful combines this session
+    runCount    = 0,                -- successful combines in the current run
+    lastItem    = nil,
+    lastQty     = 0,
+    resultSeq   = 0,                -- +1 every time a "Collected ..." message arrives
+    vibrated    = false,            -- "highest vibration" seen since last full place
+    cfgPath     = nil,
+    uiMsg = nil, uiOk = true, uiUntil = 0,
+    sendCount   = 0,                -- raw packets sent
+    template    = nil,              -- copy of a real packet you sent by hand (auto-captured)
+    sending     = false,            -- true while WE send, so we don't capture our own packets
+}
+
+local function say(msg) LogToConsole(msg) end
+local function setMsg(text, ok) S.uiMsg, S.uiOk, S.uiUntil = text, ok, os.time() + 5 end
+local function setStage(text, col) S.stage, S.stageCol = text, col end
+local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+
+local function nap(ms)
+    local left = ms
+    while left > 0 and S.running do
+        local s = math.min(250, left)
+        Sleep(s)
+        left = left - s
+    end
+end
+
+---------------- INVENTORY ----------------
+local function getItemCount(id)
+    local ok, n = pcall(function()
+        for _, itm in pairs(GetInventory()) do
+            if itm.id == id then return itm.amount end
+        end
+        return 0
+    end)
+    if ok and type(n) == "number" then return n end
+    return nil
+end
+
+local function recipeMax(r)                  -- how many times this recipe can be made right now
+    local best = nil
+    for _, k in ipairs(COLOR_ORDER) do
+        local need = r[k] or 0
+        if need > 0 then
+            local have = getItemCount(CRYSTAL[k])
+            if have == nil then return nil end
+            local canMake = math.floor(have / need)
+            if best == nil or canMake < best then best = canMake end
+        end
+    end
+    return best or 0
+end
+
+---------------- CONFIG SAVE / LOAD ----------------
+local function saveConfig(silent)
+    local lines = {}
+    for _, k in ipairs(SAVE_KEYS) do lines[#lines + 1] = k .. "=" .. tostring(cfg[k]) end
+    local data = table.concat(lines, "\n") .. "\n"
+    local order = {}
+    if S.cfgPath then order[1] = S.cfgPath end
+    for _, p in ipairs(CONFIG_PATHS) do order[#order + 1] = p end
+    for _, p in ipairs(order) do
+        local ok, f = pcall(io.open, p, "w")
+        if ok and f then
+            if pcall(function() f:write(data) f:close() end) then
+                S.cfgPath = p
+                if not silent then setMsg("Config saved (" .. p .. ")", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("Could not save config", false) end
+    return false
+end
+
+local function loadConfig(silent)
+    for _, p in ipairs(CONFIG_PATHS) do
+        local ok, f = pcall(io.open, p, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            if rok and data and data ~= "" then
+                for line in data:gmatch("[^\r\n]+") do
+                    local k, v = line:match("^(%w+)=(.*)$")
+                    if k and SAVE_SET[k] and cfg[k] ~= nil then
+                        cfg[k] = tonumber(v) or cfg[k]
+                    end
+                end
+                S.cfgPath = p
+                if not silent then setMsg("Config loaded", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("No saved config found", false) end
+    return false
+end
+
+---------------- RAW PACKET SENDING ----------------
+local function rawPacket(value, px, py)
+    local x, y = 0, 0
+    local netid = 0
+    pcall(function()
+        local p = GetLocal().pos
+        x, y = p.x, p.y
+    end)
+    local pkt = {
+        type = 3, value = value, px = px, py = py,
+        x = x, y = y, xspeed = 0, yspeed = 0,
+        netid = netid, snetid = netid, state = 0,
+        padding1 = 0, padding2 = 0, padding4 = 0.0, padding5 = 0,
+        dropped = 0, extrasize = 0,
+    }
+    -- reuse the extra fields (state, speeds, padding) of a real packet you sent by hand
+    if S.template then
+        local keep = { type = true, value = true, px = true, py = true,
+                       x = true, y = true, netid = true }
+        for k, v in pairs(S.template) do
+            if not keep[k] then pkt[k] = v end
+        end
+    end
+    return pkt
+end
+
+local function send(pkt)
+    S.sending = true
+    local ok = pcall(SendPacketRaw, false, pkt)
+    S.sending = false
+    S.sendCount = S.sendCount + 1
+    return ok
+end
+
+-- the real client follows each tile packet (type 3) with a state packet (type 0)
+local STATE_PLACE = 3104
+local function sendStatePacket(value)
+    local pkt = rawPacket(value, cfg.combineX, cfg.combineY)
+    pkt.type  = 0
+    pkt.state = STATE_PLACE
+    return send(pkt)
+end
+
+local function sendTile(id)
+    local ok = send(rawPacket(id, cfg.combineX, cfg.combineY))
+    if ok then sendStatePacket(id) end
+    return ok
+end
+
+local function sendPlace(colorKey) return sendTile(CRYSTAL[colorKey]) end
+local function sendPunch()         return sendTile(CRYSTAL.FIST) end
+
+---------------- HOOKS ----------------
+local function onVariant(var)
+    local name = tostring(var[0] or "")
+    if name == "OnTalkBubble" then
+        local txt = tostring(var[2] or var[1] or "")
+        if txt:lower():find("highest vibration", 1, true) then S.vibrated = true end
+        return false
+    end
+    if name == "OnConsoleMessage" then
+        local clean = tostring(var[1] or (var[2] or "")):gsub("`.", "")
+        local qty, item = clean:match("Collected%s+(%d+)%s+(.-)%.?%s*$")
+        if qty then
+            S.lastQty  = tonumber(qty) or 0
+            S.lastItem = trim(item)
+            S.resultSeq = S.resultSeq + 1      -- counts EVERY result, even if the amount is the same
+        end
+    end
+    return false
+end
+
+local function register(events, hookName, fn)
+    local owner = nil
+    for i, ev in ipairs(events) do
+        local wrapped = function(...)
+            if owner == nil then owner = i end
+            if owner ~= i then return false end
+            return fn(...)
+        end
+        pcall(AddHook, ev, hookName .. i, wrapped)
+    end
+end
+
+local TEMPLATE_FIELDS = { "type", "value", "px", "py", "x", "y", "xspeed", "yspeed",
+    "netid", "snetid", "state", "padding1", "padding2", "padding4", "padding5",
+    "dropped", "extrasize" }
+
+-- silently remembers the last tile packet you sent by hand
+local function onSendRaw(pkt)
+    if S.sending then return false end
+    local ok, t = pcall(function() return pkt.type end)
+    if not ok or t ~= 3 then return false end
+    local copy = {}
+    for _, k in ipairs(TEMPLATE_FIELDS) do
+        local okf, v = pcall(function() return pkt[k] end)
+        if okf and v ~= nil then copy[k] = v end
+    end
+    S.template = copy
+    return false
+end
+register({ "onsendpacketraw", "OnSendPacketRaw", "onsendpacket", "OnSendPacket" }, "ac_send", onSendRaw)
+register({ "onvariant", "OnVariant" }, "ac_var", onVariant)
+
+---------------- MOVE TO THE COMBINE TILE ----------------
+-- Same safe walking as Auto Geiger: small hops, waits to arrive before the
+-- next one, never one long jump (long jumps can get you kicked).
+local rawFindPath = FindPath                      -- the game's own pathfinder
+local STEP_TILES, STEP_DELAY = 5, 300
+
+local function myTile()
+    local ok, tx, ty = pcall(function()
+        local p = GetLocal().pos
+        return math.floor(p.x / 32), math.floor(p.y / 32)
+    end)
+    if ok then return tx, ty end
+    return nil, nil
+end
+
+local function limitStep(dx, dy)
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len <= STEP_TILES then return dx, dy end
+    local f  = STEP_TILES / len
+    local mx = math.floor(math.abs(dx) * f) * (dx < 0 and -1 or 1)
+    local my = math.floor(math.abs(dy) * f) * (dy < 0 and -1 or 1)
+    if mx == 0 and my == 0 then
+        if math.abs(dx) >= math.abs(dy) then mx = (dx < 0) and -1 or 1
+        else my = (dy < 0) and -1 or 1 end
+    end
+    return mx, my
+end
+
+local function hop(nx, ny)
+    local sx, sy = myTile()
+    pcall(rawFindPath, nx, ny)
+    local lastx, lasty, still = sx, sy, 0
+    for _ = 1, 20 do                              -- at most ~2 seconds
+        if not S.running then break end
+        nap(100)
+        local cx, cy = myTile()
+        if cx == nx and cy == ny then return true end
+        if cx == lastx and cy == lasty then still = still + 1 else still = 0 end
+        lastx, lasty = cx, cy
+        if still >= 4 then break end
+    end
+    local ex, ey = myTile()
+    return ex ~= sx or ey ~= sy
+end
+
+local function goToTile()
+    if type(rawFindPath) ~= "function" then
+        say("`4[Auto Crystal] `wFindPath not found - stand on the tile yourself.")
+        return true                               -- don't block the run, just skip moving
+    end
+    setStage("Moving to tile", C.cyan)
+    local stuck = 0
+    while S.running do
+        local cx, cy = myTile()
+        if cx == nil then return true end
+        local dx, dy = cfg.combineX - cx, cfg.combineY - cy
+        if dx == 0 and dy == 0 then nap(400) return true end   -- arrived, let it settle
+        local mx, my = limitStep(dx, dy)
+        if stuck > 0 then
+            mx = (mx > 0) and 1 or ((mx < 0) and -1 or 0)
+            my = (my > 0) and 1 or ((my < 0) and -1 or 0)
+        end
+        if hop(cx + mx, cy + my) then stuck = 0
+        else
+            stuck = stuck + 1
+            if stuck >= 3 then
+                say("`4[Auto Crystal] `wBlocked on the way to " .. cfg.combineX .. "," .. cfg.combineY .. " - stopping.")
+                return false
+            end
+        end
+        nap(STEP_DELAY + math.random(0, 100))
+    end
+    return false
+end
+
+---------------- ONE COMBINE CYCLE ----------------
+-- Returns "ok" / "no-result" / "stopped"
+local function runOneCycle(r)
+    S.vibrated = false
+    local startSeq = S.resultSeq
+    local tStart = os.time()
+
+    setStage("Placing crystals", C.cyan)
+    for _, k in ipairs(COLOR_ORDER) do
+        for i = 1, (r[k] or 0) do
+            if not S.running then return "stopped" end
+            sendPlace(k)
+            nap(cfg.placeDelayMs + math.random(0, 120))
+        end
+    end
+    if not S.running then return "stopped" end
+
+    -- wait for the "highest vibration" cue (don't block forever on it)
+    setStage("Waiting for recipe", C.yellow)
+    local t0 = os.time()
+    while S.running and not S.vibrated and os.time() - t0 < math.ceil(cfg.confirmWaitMs / 1000) do
+        nap(200)
+    end
+    if not S.running then return "stopped" end
+
+    setStage("Punching", C.green)
+    local tries, gotResult = 0, false
+    while S.running and tries <= cfg.punchRetries and not gotResult do
+        tries = tries + 1
+        sendPunch()
+        local t1 = os.time()
+        while S.running and os.time() - t1 < math.ceil(cfg.punchWaitMs / 1000) do
+            if S.resultSeq ~= startSeq then gotResult = true break end
+            nap(150)
+        end
+    end
+    if not S.running then return "stopped" end
+
+    if gotResult then return "ok" end
+    say("`4[Auto Crystal] `wNo result after punching (vibration: " .. (S.vibrated and "yes" or "no")
+        .. ", hand-placed packet captured: " .. (S.template and "yes" or "no")
+        .. ", took " .. (os.time() - tStart) .. "s) - wrong combo, or the drop wasn't auto-picked up.")
+    return "no-result"
+end
+
+---------------- MAIN LOOP ----------------
+local function mainLoop()
+    local r = RECIPES[cfg.recipe]
+    S.runCount = 0
+    if not goToTile() then
+        S.running = false
+        S.threadAlive = false
+        setStage("Idle", C.white)
+        return
+    end
+    while S.running do
+        if cfg.amount > 0 and S.runCount >= cfg.amount then
+            say("`2[Auto Crystal] `wDone: " .. S.runCount .. " x " .. r.name .. " combined.")
+            break
+        end
+        local can = recipeMax(r)
+        if can == nil then
+            say("`4[Auto Crystal] `wCan't read your inventory - stopping.")
+            break
+        end
+        if can <= 0 then
+            say("`2[Auto Crystal] `wOut of crystals for " .. r.name .. ". Stopping (" .. S.runCount .. " made).")
+            break
+        end
+
+        local result = runOneCycle(r)
+        if result == "stopped" then break end
+        if result ~= "ok" then
+            say("`4[Auto Crystal] `wStopping so you don't waste crystals.")
+            break
+        end
+        S.cycles = S.cycles + 1
+        S.runCount = S.runCount + 1
+
+        setStage("Cooldown", C.gray)
+        nap(cfg.cycleGapMs)
+    end
+    S.running = false
+    S.threadAlive = false
+    setStage("Idle", C.white)
+end
+
+local function stopRun(reason)
+    if not S.running then return end
+    S.running = false
+    say("`4[Auto Crystal] `wStopping: " .. (reason or "stopped by user."))
+end
+
+local function startRun()
+    if S.threadAlive then setMsg("Still stopping, try again in a second.", false) return end
+    if cfg.combineX == 0 and cfg.combineY == 0 then
+        setMsg("Set the combine tile position first (Recipe tab).", false)
+        return
+    end
+    if type(SendPacketRaw) ~= "function" then
+        setMsg("SendPacketRaw not found in this executor.", false)
+        return
+    end
+    saveConfig(true)
+    S.running, S.threadAlive = true, true
+    S.vibrated = false
+    setStage("Starting", C.green)
+    say("`2[Auto Crystal] `wStarted: " .. RECIPES[cfg.recipe].name)
+    RunThread(function()
+        local ok, err = pcall(mainLoop)
+        if not ok then say("`4[Auto Crystal] `wError: " .. tostring(err)) end
+        S.running, S.threadAlive = false, false
+        setStage("Idle", C.white)
+    end)
+end
+
+---------------- MENU ----------------
+local DEFAULTS = {}
+for _, k in ipairs(SAVE_KEYS) do DEFAULTS[k] = cfg[k] end
+
+local tab  = 1
+local TABS = { "Stats", "Recipe", "Advanced" }
+
+local function intInput(label, key, min)
+    local _, v = ImGui.InputInt(label, cfg[key])
+    if v then cfg[key] = math.max(min, v) end
+end
+
+local function resetCount()
+    S.cycles = 0
+    setMsg("Count reset", true)
+end
+
+local function resetDefaults()
+    for _, k in ipairs(SAVE_KEYS) do cfg[k] = DEFAULTS[k] end
+    setMsg("Settings reset to default", true)
+end
+
+local function statusInfo()
+    if S.threadAlive and not S.running then return "Stopping", C.yellow end
+    if not S.running then return "Idle", C.white end
+    return S.stage, S.stageCol
+end
+
+local function tabStats()
+    local label, col = statusInfo()
+    textColored(col, label)
+    ui("SameLine")
+    textColored(C.gray, "   tile " .. cfg.combineX .. "," .. cfg.combineY)
+
+    ui("Spacing")
+    local r = RECIPES[cfg.recipe]
+    textColored(C.white, "Recipe: " .. r.name .. "  (makes x" .. r.amt .. ")")
+    local can = recipeMax(r)
+    rowv("Can make right now", can and tostring(can) or "-", C.cyan)
+
+    ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+    rowv("This run", S.runCount .. " / " .. (cfg.amount > 0 and cfg.amount or "infinite"), C.white)
+    rowv("Combined this session", tostring(S.cycles), C.white)
+    rowv("Last result", S.lastItem and (S.lastQty .. " x " .. S.lastItem) or "-", C.green)
+    rowv("Hand-placed packet", S.template and "captured" or "not captured", S.template and C.green or C.yellow)
+    ui("Spacing")
+
+    if button("Reset Count", -1, 30) then resetCount() end
+end
+
+---------------- TAB: RECIPE ----------------
+local function tabRecipe()
+    textColored(C.white, "Combine tile (stand here, place and punch here)")
+    local okp, mx, my = pcall(function() local p = GetLocal().pos return p.x // 32, p.y // 32 end)
+    textColored(C.gray, "You are standing at: " .. (okp and (mx .. ", " .. my) or "unknown"))
+    intInput("Tile X", "combineX", 0)
+    intInput("Tile Y", "combineY", 0)
+    if button(" Capture (use my position) ") then
+        if okp then
+            cfg.combineX, cfg.combineY = mx, my
+            setMsg("Combine tile set to " .. mx .. ", " .. my, true)
+        else
+            setMsg("Could not read your position.", false)
+        end
+    end
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Recipe")
+    local r = RECIPES[cfg.recipe]
+    if button(" < ", 40) then cfg.recipe = (cfg.recipe - 2) % #RECIPES + 1 end
+    ui("SameLine")
+    textColored(C.white, "  " .. r.name .. "  (" .. cfg.recipe .. "/" .. #RECIPES .. ")")
+    ui("SameLine")
+    if button(" > ", 40) then cfg.recipe = (cfg.recipe % #RECIPES) + 1 end
+    r = RECIPES[cfg.recipe]       -- re-read, in case a button above just changed it
+
+    ui("Spacing")
+    intInput("Amount (0 = infinite)", "amount", 0)
+
+    ui("Spacing")
+    textColored(C.gray, "Needs (place in this order):")
+    for _, k in ipairs(COLOR_ORDER) do
+        local need = r[k] or 0
+        if need > 0 then
+            local have = getItemCount(CRYSTAL[k])
+            rowv(COLOR_NAME[k] .. " Crystal", need .. "x   (have " .. tostring(have or "?") .. ")",
+                (have and have >= need) and C.green or C.red)
+        end
+    end
+    ui("Spacing")
+    textColored(C.gray, "Makes " .. r.amt .. " x " .. r.name .. " per combine.")
+end
+
+local function tabAdvanced()
+    intInput("Place delay (ms)", "placeDelayMs", 100)
+    intInput("Wait for vibration (ms)", "confirmWaitMs", 500)
+    intInput("Wait after punch (ms)", "punchWaitMs", 500)
+    intInput("Punch retries", "punchRetries", 0)
+    intInput("Gap between combines (ms)", "cycleGapMs", 0)
+end
+
+---------------- DRAW ----------------
+local function drawBody()
+    if S.threadAlive and not S.running then
+        textColored(C.yellow, "Stopping... please wait a second.")
+    elseif not S.running then
+        if bigButton(">  START COMBINE") then startRun() end
+    else
+        if bigButton("[]  STOP COMBINE",
+            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            stopRun("stopped by user.")
+        end
+    end
+
+    section("CONFIG")
+    textColored(C.white, S.cfgPath or "autocrystal_config.txt")
+    ui("SameLine", 170)
+    if button(" Save ", 70, 0) then saveConfig() end
+    ui("SameLine")
+    if button(" Load ", 70, 0) then loadConfig() end
+    ui("SameLine")
+    if button(" Default ", 80, 0) then resetDefaults() end
+
+    if S.uiMsg and os.time() < S.uiUntil then
+        textColored(S.uiOk and C.green or C.red, S.uiMsg)
+    end
+
+    ui("Spacing")
+    for i, name in ipairs(TABS) do
+        if i > 1 then ui("SameLine") end
+        if tab == i then
+            colorButton(" " .. name .. " ", 0, 0,
+                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
+        else
+            if button(" " .. name .. " ", 0, 0) then tab = i end
+        end
+    end
+    ImGui.Separator()
+    ui("Spacing")
+
+    if     tab == 1 then tabStats()
+    elseif tab == 2 then tabRecipe()
+    else                 tabAdvanced() end
+end
+
+local drawErrors = 0
+AddHook("ondraw", "ac_menu", function(dt)
+    local nc, nv = pushTheme()
+    ui("SetNextWindowSize", 440, 0, 4)
+    ImGui.Begin("Auto Crystal Combine")
+    local widthPushed = ui("PushItemWidth", 220)
+
+    if drawErrors < 3 then
+        local ok, err = pcall(drawBody)
+        if not ok then
+            drawErrors = drawErrors + 1
+            say("`4[Auto Crystal] `wMenu error: " .. tostring(err))
+        end
+    end
+
+    if widthPushed then ui("PopItemWidth") end
+    ImGui.End()
+    popTheme(nc, nv)
+end)
+
+math.randomseed(os.time())
+loadConfig(true)
+say("`2[Auto Crystal] `wloaded." .. (S.cfgPath and " Config loaded." or "")
+    .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+end  -- startAutoCrystal
+
 ---------------- LOADER MENU ---------------------------
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
     { name = "Auto Geiger",           run = startGeiger },
+    { name = "Auto Crystal Combine",  run = startAutoCrystal },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

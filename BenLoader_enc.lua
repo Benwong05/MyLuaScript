@@ -3263,12 +3263,38 @@ say("`2[Auto Crystal] `wloaded." .. (S.cfgPath and " Config loaded." or "")
 
 end  -- startAutoCrystal
 
+local function startAutoModage()
+local function say(msg) LogToConsole(msg) end
+
+AddHook("onvariant", "mommy", function(var)
+    if var[0] == "OnConsoleMessage" and var[1]:find("You are recovering") then
+        SendPacket(2, "action|input\n|text|/modage 60")
+    end
+    if var[0] == "OnConsoleMessage" and var[1]:find("not allowed to perform surgery") then
+        SendPacket(2, "action|input\n|text|/modage 60")
+    end
+    if var[0] == "OnConsoleMessage" and var[1]:find("Spam detected!") then
+        return true
+    end
+    if var[0] == "OnTalkBubble" and var[2]:find("You are healed") then
+        return true
+    end
+    if var[0] == "OnTalkBubble" and var[2]:find("!reset") then
+        SendPacket(2, "action|input\n|text|/modage 60")
+    end
+end)
+
+say("`2[Auto Modage] `wloaded.")
+
+end  -- startAutoModage
+
 ---------------- LOADER MENU ---------------------------
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
     { name = "Auto Geiger",           run = startGeiger },
     { name = "Auto Crystal Combine",  run = startAutoCrystal },
+    { name = "Auto Modage",           run = startAutoModage },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

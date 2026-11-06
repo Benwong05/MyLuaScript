@@ -1187,12 +1187,16 @@ local function startVendHelper()
 -- STATE (edit defaults here, or change live in the menu)
 ---------------------------------------------------------------
 local MAX_AMOUNT = 250        -- upper limit for the buy amount (the game input allows 3 digits)
+local MAX_SELL_AMOUNT = 999   -- the "How many to sell?" box only accepts 3 digits (add_text_input|sellamount|How many to sell?|0|3|)
 
 
 local S = {
     add    = true,   -- auto add stock when wrenching your own vend
     buy    = false,  -- auto buy when wrenching someone's vend
     amount = 1,      -- how many to buy
+    sell      = false,  -- auto sell when a "Buying Machine" dialog opens
+    sellAmount = 1,     -- how many to sell (ignored if sellAll is on)
+    sellAll    = false, -- sell your entire stack instead of a fixed amount
     instant  = true,  -- auto-press Buy on the Purchase Confirmation dialog (always on)
     delay  = 30,     -- ms to wait before sending the buy / confirm packets (0 = instant)
     hide   = true,   -- hide the dialog when the script handles it
@@ -1247,6 +1251,13 @@ local function clampAmount(n)
     n = math.floor(tonumber(n) or 1)
     if n < 1 then n = 1 end
     if n > MAX_AMOUNT then n = MAX_AMOUNT end
+    return n
+end
+
+local function clampSell(n)
+    n = math.floor(tonumber(n) or 1)
+    if n < 1 then n = 1 end
+    if n > MAX_SELL_AMOUNT then n = MAX_SELL_AMOUNT end
     return n
 end
 
@@ -1367,6 +1378,157 @@ local function handleConfirm(dialog)
 end
 
 ---------------------------------------------------------------
+-- AUTO SELL (a "Buying Machine" - you give items, it gives World Locks)
+-- Detected by the dialog's own wording ("Buying Machine" header and the
+-- "How many to sell?" prompt), not by dialog_name, since that name isn't
+-- fixed. Answers with S.sellAmount (or your full stack if sellAll is on)
+-- in a single dialog_return - no separate confirm step needed.
+---------------------------------------------------------------
+local function isSellMachineDialog(dialog)
+    local d = dialog:lower()
+    return d:find("buying machine", 1, true) ~= nil
+        or d:find("how many to sell", 1, true) ~= nil
+end
+
+-- The Buying Machine's own "Purchase Confirmation" step (after you answer the
+-- first dialog) is marked by the sellamount/wtb fields it embeds - a normal
+-- buy's confirmation never has those, only "buyamount".
+local function isSellConfirmDialog(dialog)
+    return dialog:find("embed_data|sellamount|", 1, true) ~= nil
+        or dialog:find("embed_data|wtb|", 1, true) ~= nil
+end
+
+-- A Buying Machine's dialog carries an extra embed_data field identifying
+-- which item it buys (e.g. "embed_data|wtb|2286", 2286 = the item's id).
+-- x/y are handled separately, so skip those here and just echo back
+-- whatever else the dialog embeds - the server likely needs it to know
+-- which item/listing the sale applies to.
+local function extraEmbedFields(dialog)
+    local extras = {}
+    for k, v in dialog:gmatch("embed_data|([%w_]+)|([^\n\r]*)") do
+        if k ~= "x" and k ~= "y" then
+            v = v:gsub("|%s*$", "")
+            extras[#extras + 1] = { k, v }
+        end
+    end
+    return extras
+end
+
+local function handleSellMachine(dialog)
+    local dialogName = dialog:match("end_dialog|([^|]*)|")
+    if not dialogName or dialogName == "vend_edit" then return false end
+
+    local x = dialog:match("embed_data|x|(%-?%d+)") or dialog:match("embed_data|tilex|(%-?%d+)") or lastWrench.x
+    local y = dialog:match("embed_data|y|(%-?%d+)") or dialog:match("embed_data|tiley|(%-?%d+)") or lastWrench.y
+    local inputName = dialog:match("add_text_input|([^|]*)|")
+
+    -- some clients label this button something other than plain "Sell" (e.g. with
+    -- an icon tag in front), so also accept a button whose label just ends in "Sell"
+    local buttonField = dialog:match("add_button|([^|]*)|Sell|")
+        or dialog:match("add_button|([^|]*)|[^|]-Sell|")
+
+    local have     = tonumber(dialog:match("You have (%d+)"))
+    local itemName = dialog:match("You have %d+ ([^.]+)%.")
+
+    local extraStr = {}
+    for _, e in ipairs(extraEmbedFields(dialog)) do extraStr[#extraStr + 1] = e[1] .. "=" .. e[2] end
+    dbg(string.format("SELL name=%s input=%s button=%s x=%s y=%s have=%s item=%s extra=%s",
+        tostring(dialogName), tostring(inputName), tostring(buttonField), tostring(x), tostring(y),
+        tostring(have), tostring(itemName), table.concat(extraStr, ",")))
+
+    if not (inputName and x and y) then
+        log("Buying Machine dialog found but could not parse it (no text input / tile found). Turn on Debug and send me the raw [DIALOG ...] output.")
+        return false
+    end
+
+    local amt
+    if S.sellAll then
+        amt = math.min(have or 0, MAX_SELL_AMOUNT)
+        if have and have > MAX_SELL_AMOUNT then
+            log(string.format(
+                "You have %d %s but the sell box only takes 3 digits (max %d). Selling %d now - wrench again for the rest.",
+                have, tostring(itemName or "item"), MAX_SELL_AMOUNT, amt))
+        end
+    else
+        amt = clampSell(S.sellAmount)
+        if have and amt > have then amt = have end
+    end
+
+    if not amt or amt <= 0 then
+        dbg("Nothing to sell (you have 0" .. (itemName and (" " .. itemName) or "") .. ").")
+        return false
+    end
+
+    -- trailing "|" after the value matches the real packet format captured for
+    -- the other quantity dialog (vend_buyconfirm's buyamount|%s|)
+    local pkt = string.format(
+        "action|dialog_return\ndialog_name|%s\nx|%s|\ny|%s|\n%s|%d|\n",
+        dialogName, x, y, inputName, amt)
+    for _, e in ipairs(extraEmbedFields(dialog)) do
+        pkt = pkt .. string.format("%s|%s|\n", e[1], e[2])
+    end
+    if buttonField then
+        pkt = pkt .. string.format("buttonClicked|%s\n", buttonField)
+    end
+
+    dbg("SELL sending:\n" .. pkt)
+    later(S.delay, function()
+        SendPacket(2, pkt)
+        watch = 5
+        log(string.format("Sell sent: %d x %s at (%s, %s)", amt, tostring(itemName or "item"), x, y))
+    end)
+    return S.hide
+end
+
+---------------------------------------------------------------
+-- SELL - PURCHASE CONFIRMATION step
+-- After the first dialog, the machine asks you to confirm with a second
+-- "Purchase Confirmation" dialog. It has no editable fields at all - just
+-- embed_data (sellamount, wtb, x, y) that the server already filled in -
+-- so the whole reply is just echoing those embed_data fields straight back.
+---------------------------------------------------------------
+local function handleSellConfirm(dialog)
+    local dialogName = dialog:match("end_dialog|([^|]*)|") or "buy_useconfirm"
+    if dialogName == "vend_edit" then return false end
+
+    local x = dialog:match("embed_data|x|(%-?%d+)") or dialog:match("embed_data|tilex|(%-?%d+)") or lastWrench.x
+    local y = dialog:match("embed_data|y|(%-?%d+)") or dialog:match("embed_data|tiley|(%-?%d+)") or lastWrench.y
+    local extras = extraEmbedFields(dialog)   -- everything embedded besides x/y (e.g. sellamount, wtb)
+
+    local extraStr = {}
+    for _, e in ipairs(extras) do extraStr[#extraStr + 1] = e[1] .. "=" .. e[2] end
+    dbg(string.format("SELL CONFIRM name=%s x=%s y=%s extra=%s",
+        tostring(dialogName), tostring(x), tostring(y), table.concat(extraStr, ",")))
+
+    if not (x and y) or #extras == 0 then
+        log("Sell confirmation dialog found but could not parse it. Turn on Debug and send me the raw [DIALOG ...] output.")
+        return false
+    end
+
+    local pkt = string.format("action|dialog_return\ndialog_name|%s\nx|%s|\ny|%s|\n", dialogName, x, y)
+    for _, e in ipairs(extras) do
+        pkt = pkt .. string.format("%s|%s|\n", e[1], e[2])
+    end
+
+    -- grab whichever embedded field looks like the amount, just for the log line
+    local amtLabel
+    for _, e in ipairs(extras) do
+        if e[1]:lower():find("amount", 1, true) then
+            amtLabel = e[2]
+            break
+        end
+    end
+
+    dbg("SELL CONFIRM sending:\n" .. pkt)
+    later(S.delay, function()
+        SendPacket(2, pkt)
+        watch = 5
+        log(string.format("Sell confirmed: %s item(s) at (%s, %s)", tostring(amtLabel or "?"), x, y))
+    end)
+    return S.hide
+end
+
+---------------------------------------------------------------
 -- HOOK: incoming dialog (opens after you wrench a machine)
 ---------------------------------------------------------------
 local function on_variant(var)
@@ -1376,9 +1538,9 @@ local function on_variant(var)
     if watch > 0 and (fname == "OnConsoleMessage" or fname == "OnTalkBubble") then
         local txt = clean(fname == "OnTalkBubble" and field(var, "v3", 2) or field(var, "v2", 1))
         watch = watch - 1
-        if txt:find("bought", 1, true) then
+        if txt:find("bought", 1, true) or txt:find("sold", 1, true) then
             watch = 0
-            log("PURCHASE OK: " .. txt)
+            log("RESULT OK: " .. txt)
         else
             log("Server said: " .. txt:sub(1, 160))
         end
@@ -1388,17 +1550,29 @@ local function on_variant(var)
     local dialog = field(var, "v2", 1) or ""
     local dname = dialog:match("end_dialog|([^|]*)|")
     local isConfirm = dname == "vend_buyconfirm" or dialog:find("Purchase Confirmation", 1, true)
+    local isSellMachine = isSellMachineDialog(dialog)
+    local isSellConfirm = isConfirm and isSellConfirmDialog(dialog)
 
-    -- debug recorder: show every vend related dialog, whatever the toggles are
-    if S.debug and (isConfirm or (dname and dname:lower():find("vend", 1, true))) then
+    -- debug recorder: show every vend / buying-machine related dialog, whatever the toggles are
+    if S.debug and (isConfirm or isSellMachine or (dname and dname:lower():find("vend", 1, true))) then
         log("DIALOG [" .. tostring(dname) .. "]:\n" .. dialog)
     end
 
+    -- check the sell-flavoured confirmation BEFORE the generic one: a sell's
+    -- confirm dialog also matches isConfirm (it says "Purchase Confirmation"
+    -- too), but needs the different handler above, not handleConfirm's
+    -- buy-amount logic.
+    if S.instant and isSellConfirm then
+        return handleSellConfirm(dialog)
+    end
     if S.instant and isConfirm then
         return handleConfirm(dialog)
     end
     if S.add and dialog:find("Add items to the machine", 1, true) then
         return handleAdd(dialog)
+    end
+    if S.sell and isSellMachine then
+        return handleSellMachine(dialog)
     end
     if S.buy then
         return handleBuy(dialog)
@@ -1411,7 +1585,7 @@ end
 -- Saves: auto add, auto buy, amount, instant buy, step delay, hide dialog.
 -- (Debug and menu visibility are not saved.) Loaded automatically on start.
 ---------------------------------------------------------------
-local CONFIG_KEYS  = { "add", "buy", "amount", "hide" }  -- instant/delay are fixed (always on / 30ms)
+local CONFIG_KEYS  = { "add", "buy", "amount", "sell", "sellAmount", "sellAll", "hide" }  -- instant/delay are fixed (always on / 30ms)
 local CONFIG_PATHS = { "scripts/vend_helper.cfg", "vend_helper.cfg" }   -- first one that works is used
 local status = ""   -- shown under the buttons in the menu
 
@@ -1467,7 +1641,8 @@ local function loadConfig(quiet)
                         end
                     end
                 end
-                S.amount = clampAmount(S.amount)
+                S.amount     = clampAmount(S.amount)
+                S.sellAmount = clampSell(S.sellAmount)
                 S.delay  = math.min(5000, math.max(0, math.floor(S.delay)))
                 status = "Config loaded"
                 log("Config loaded from " .. path)
@@ -1528,6 +1703,26 @@ local function drawMenu()
     if button("+10", 60) then S.amount = clampAmount(S.amount + 10) end
     ui("SameLine")
     if button("Max", 60) then S.amount = MAX_AMOUNT end
+
+    section("AUTO SELL (Buying Machine)")
+    if button(" Auto Sell to Buying Machine: " .. (S.sell and "ON" or "OFF") .. " ") then
+        S.sell = not S.sell
+    end
+    if button(" Sell entire stack: " .. (S.sellAll and "ON" or "OFF") .. " ") then
+        S.sellAll = not S.sellAll
+    end
+    if not S.sellAll then
+        ui("Spacing")
+        local _, samt = ImGui.InputInt("Sell amount", S.sellAmount)
+        if samt then S.sellAmount = clampSell(samt) end
+        if button("-10", 60) then S.sellAmount = clampSell(S.sellAmount - 10) end
+        ui("SameLine")
+        if button("+10", 60) then S.sellAmount = clampSell(S.sellAmount + 10) end
+        ui("SameLine")
+        if button("+100", 60) then S.sellAmount = clampSell(S.sellAmount + 100) end
+    else
+        textColored(C.gray, "Will sell everything you have of that item.")
+    end
 
     section("OPTIONS")
     if button(" Hide dialog when handled: " .. (S.hide and "ON" or "OFF") .. " ") then
@@ -3263,38 +3458,12 @@ say("`2[Auto Crystal] `wloaded." .. (S.cfgPath and " Config loaded." or "")
 
 end  -- startAutoCrystal
 
-local function startAutoModage()
-local function say(msg) LogToConsole(msg) end
-
-AddHook("onvariant", "mommy", function(var)
-    if var[0] == "OnConsoleMessage" and var[1]:find("You are recovering") then
-        SendPacket(2, "action|input\n|text|/modage 60")
-    end
-    if var[0] == "OnConsoleMessage" and var[1]:find("not allowed to perform surgery") then
-        SendPacket(2, "action|input\n|text|/modage 60")
-    end
-    if var[0] == "OnConsoleMessage" and var[1]:find("Spam detected!") then
-        return true
-    end
-    if var[0] == "OnTalkBubble" and var[2]:find("You are healed") then
-        return true
-    end
-    if var[0] == "OnTalkBubble" and var[2]:find("!reset") then
-        SendPacket(2, "action|input\n|text|/modage 60")
-    end
-end)
-
-say("`2[Auto Modage] `wloaded.")
-
-end  -- startAutoModage
-
 ---------------- LOADER MENU ---------------------------
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
     { name = "Auto Geiger",           run = startGeiger },
     { name = "Auto Crystal Combine",  run = startAutoCrystal },
-    { name = "Auto Modage",           run = startAutoModage },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

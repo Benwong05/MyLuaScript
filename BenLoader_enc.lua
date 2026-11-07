@@ -2466,22 +2466,24 @@ end
 ---------------- HOOKS --------------------------------
 local function ringHook(packet)
     if not S.running then return false end
-    if packet.type == 17 then
-        if packet.xspeed == 2.00 then
-            log("`2Green...")
-            currentRing = green
-            S.ring = "Green"
-        elseif packet.xspeed == 1.00 then
-            log("`9Yellow...")
-            currentRing = yellow
-            S.ring = "Yellow"
-        else
-            log("`4Red...")
-            currentRing = red
-            S.ring = "Red"
-        end
-        newRing = true
+    if packet.type ~= 17 then return false end
+    -- real geiger rings always come with yspeed 114; titles (e.g. Mythical) spam
+    -- type 17 particle packets with other yspeeds (62, 32...) that must be ignored
+    if math.abs(packet.yspeed - 114) > 0.5 then return false end
+    if packet.xspeed == 2.00 then
+        log("`2Green...")
+        currentRing = green
+        S.ring = "Green"
+    elseif packet.xspeed == 1.00 then
+        log("`9Yellow...")
+        currentRing = yellow
+        S.ring = "Yellow"
+    else
+        log("`4Red...")
+        currentRing = red
+        S.ring = "Red"
     end
+    newRing = true
     return false
 end
 

@@ -3460,12 +3460,1674 @@ say("`2[Auto Crystal] `wloaded." .. (S.cfgPath and " Config loaded." or "")
 
 end  -- startAutoCrystal
 
+--====================================================
+--  AUTO GEIGER CHARGER v2  (module for Ben Loader)
+--
+--  Uses the loader's shared helpers (C, ui, textColored, section, button,
+--  bigButton, colorButton, rowv, progressBar, pushTheme, popTheme).
+--
+--  HOW IT WORKS
+--    1. Scans the whole world once (tile ids + collision) and finds every
+--       Geiger Charger. Chargers are SOLID, so it never walks into them.
+--    2. Finds every free tile you could stand on (open space with ground
+--       under it) that is connected to where you are, then picks the
+--       smallest set of "stops" that covers all chargers within punch reach.
+--    3. Walks stop to stop along real walkable tiles (own path search,
+--       then the game's FindPath for each short hop).
+--    4. At each stop it punches (retrieve) / places a dead geiger (charge)
+--       on every charger in reach. Success = your inventory changed.
+--
+--  EMPTY / FILLED
+--    A charger's state lives in its tile "extra data" (the server sends a
+--    13-byte tile update every time it changes). The script reads whatever
+--    your executor exposes; if that can't tell empty from filled it simply
+--    PROBES: punch once -> a geiger comes out = it was filled.
+--====================================================
+local function startAutoCharger()
+
+---------------- SETTINGS (defaults) -----------------
+local cfg = {
+    world        = "",      -- world with the chargers (blank = current world, no warping)
+    wallpaperId  = 0,       -- wallpaper (background) id placed behind every Geiger Charger (0 = not set)
+    deadId       = 2286,    -- dead geiger (what you put into a charger)
+    aliveId      = 2204,    -- charged geiger (what comes out)
+    mode         = 3,       -- 1 retrieve only, 2 charge only, 3 retrieve + charge
+    perCharger   = false,   -- false: retrieve ALL then charge ALL | true: both at every stop
+    actionDelay  = 100,     -- ms pause after each punch / place
+    waitResultMs = 200,     -- ms to wait for the inventory to change after an action
+    stepTiles    = 4,       -- max tiles per walking hop (lower = safer)
+    stepDelay    = 100,     -- minimum ms between hops
+    msPerTile    = 100,     -- walking pace: wait this long per tile moved (anti speed-hack)
+    standOnTop   = true,    -- stand on top of the chargers (the tile above one) when possible
+    dropOn       = true,    -- drop alive geigers when the stack is full
+    fullAt       = 250,     -- alive geiger count that counts as full
+    dropX        = 0,       -- drop spot (tile x)
+    dropY        = 0,       -- drop spot (tile y)
+    walkOrder    = 2,       -- 1 = nearest next, 2 = left side first, 3 = right side first
+    vertDown     = true,    -- inside a side: true = top to bottom, false = bottom to top
+    reachX       = 3,       -- punch / place reach left+right (tiles, rectangle)
+    reachY       = 3,       -- punch / place reach up+down (tiles, rectangle)
+    allowJump    = false,   -- no safe route found: allow ONE long jump with the game's pathfinder (flagged by speed-hack check)
+    takeOn       = true,    -- out of dead geigers: walk to the take spot and pick some up
+    takeX        = 0,       -- take spot (tile x) - where the dead geigers lie on the floor
+    takeY        = 0,       -- take spot (tile y)
+    repeatMin    = 0,       -- 0 = run once, otherwise repeat every X minutes
+    debug        = false,
+}
+
+local CONFIG_PATHS = { "autocharger_config.txt", "scripts/autocharger_config.txt", "/sdcard/autocharger_config.txt" }
+local SAVE_KEYS = { "world", "wallpaperId", "deadId", "aliveId", "mode", "perCharger", "standOnTop", "dropOn", "fullAt", "dropX", "dropY", "walkOrder", "vertDown", "takeOn", "takeX", "takeY" }
+local SAVE_SET = {}
+for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
+
+local MODES = { "Retrieve only", "Charge only", "Retrieve + Charge" }
+
+local FLAG_FLIPPED = 0x20
+local WORLD_W, WORLD_H = 100, 60
+local PUNCH_ID = 18
+local PUNCH_STATE = 2608      -- state packet the real client sends after a punch (from your dump)
+-- Punch / place reach is a rectangle: cfg.reachX tiles left/right, cfg.reachY tiles up/down (Options tab)
+local function inR(dx, dy) return math.abs(dx) <= cfg.reachX and math.abs(dy) <= cfg.reachY end
+
+---------------- STATE -------------------------------
+local S = {
+    running = false, threadAlive = false, scanning = false,
+    stage = "Idle", stageCol = C.white,
+    fg = {},              -- idx -> tile id for the whole world
+    chargers = {},        -- { x, y, key, flags, sig }
+    chargerAt = {},       -- idx -> charger
+    known = {},           -- idx -> "empty" | "filled" (learned from our own successful actions)
+    stands = 0, unreach = 0,
+    step = 0, stepsTotal = 0,
+    retrieved = 0, charged = 0, skipped = 0, nothing = 0, failed = 0, runs = 0, dropped = 0,
+    taken = 0, takeEmpty = false,
+    logN = 0,
+    curX = nil, curY = nil, dropShift = 0,
+    learnPunch = false, capturePkt = false,
+    template = nil, sending = false,
+    cfgPath = nil, uiMsg = nil, uiOk = true, uiUntil = 0,
+}
+
+local rawFindPath = FindPath                      -- the game's own pathfinder
+
+---------------- HELPERS -----------------------------
+local function say(msg) LogToConsole(msg) end
+local function setMsg(text, ok) S.uiMsg, S.uiOk, S.uiUntil = text, ok, os.time() + 5 end
+local function setStage(text, col) S.stage, S.stageCol = text, col or C.white end
+local function norm(s) return (tostring(s or ""):gsub("%s", ""):upper()) end
+local function comma(n)
+    local r = tostring(math.floor(n)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (r:gsub("^,", ""))
+end
+
+local function nap(ms)                            -- sleep that reacts quickly to STOP
+    local left = ms
+    while left > 0 and S.running do
+        local s = math.min(250, left)
+        Sleep(s)
+        left = left - s
+    end
+end
+
+local function myTile()
+    local ok, x, y = pcall(function()
+        local p = GetLocal().pos
+        return math.floor(p.x / 32), math.floor(p.y / 32)
+    end)
+    if ok then return x, y end
+    return nil, nil
+end
+
+local function curWorld()
+    local ok, v = pcall(function() return GetWorld().name end)
+    if ok and type(v) == "string" then return v:upper() end
+    return ""
+end
+
+local function getItemCount(id)
+    local ok, n = pcall(function()
+        for _, itm in pairs(GetInventory()) do
+            if itm.id == id then return itm.amount end
+        end
+        return 0
+    end)
+    if ok and type(n) == "number" then return n end
+    return nil
+end
+
+local function totalGeigers()                     -- alive + dead (a retrieve raises this)
+    local a, d = getItemCount(cfg.aliveId), getItemCount(cfg.deadId)
+    if a == nil or d == nil then return nil end
+    return a + d
+end
+
+local function idx(x, y) return y * WORLD_W + x end
+local function inb(x, y) return x >= 0 and y >= 0 and x < WORLD_W and y < WORLD_H end
+
+local function saveConfig(silent)
+    local lines = {}
+    for _, k in ipairs(SAVE_KEYS) do
+        local v = cfg[k]
+        if type(v) == "boolean" then v = v and "true" or "false" end
+        lines[#lines + 1] = k .. "=" .. tostring(v)
+    end
+    local data = table.concat(lines, "\n") .. "\n"
+    local order = {}
+    if S.cfgPath then order[1] = S.cfgPath end
+    for _, p in ipairs(CONFIG_PATHS) do order[#order + 1] = p end
+    for _, p in ipairs(order) do
+        local ok, f = pcall(io.open, p, "w")
+        if ok and f then
+            if pcall(function() f:write(data) f:close() end) then
+                S.cfgPath = p
+                if not silent then setMsg("Config saved (" .. p .. ")", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("Could not save config (no writable path)", false) end
+    return false
+end
+
+local function loadConfig(silent)
+    for _, p in ipairs(CONFIG_PATHS) do
+        local ok, f = pcall(io.open, p, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            if rok and data and data ~= "" then
+                for line in data:gmatch("[^\r\n]+") do
+                    local k, v = line:match("^(%w+)=(.*)$")
+                    if k and SAVE_SET[k] and cfg[k] ~= nil then
+                        if type(cfg[k]) == "boolean" then cfg[k] = (v == "true")
+                        elseif type(cfg[k]) == "number" then cfg[k] = tonumber(v) or cfg[k]
+                        else cfg[k] = v end
+                    end
+                end
+                cfg.mode      = math.max(1, math.min(3, cfg.mode))
+                cfg.stepTiles = math.max(1, cfg.stepTiles)            -- no upper limit
+                cfg.stepDelay = math.max(0, cfg.stepDelay)
+                cfg.msPerTile = math.max(0, cfg.msPerTile)            -- 0 allowed = no wait
+                cfg.actionDelay = math.max(0, cfg.actionDelay)
+                cfg.reachX = math.max(0, math.min(10, cfg.reachX))
+                cfg.reachY = math.max(0, math.min(10, cfg.reachY))
+                cfg.fullAt    = math.max(1, math.min(250, cfg.fullAt))
+                S.cfgPath = p
+                if not silent then setMsg("Config loaded", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("No saved config found", false) end
+    return false
+end
+
+---------------- TILE / ITEM ACCESS -------------------
+local function tf(t, k)                           -- safe field read
+    local ok, v = pcall(function() return t[k] end)
+    if ok then return v end
+    return nil
+end
+
+local function growthOf(t)                        -- number the server keeps on the tile (a unix time once it was changed)
+    local ex = tf(t, "extra")
+    if type(ex) ~= "table" then return nil end
+    return tonumber(tf(ex, "growth"))
+end
+
+local function getTile(x, y)
+    local ok, t = pcall(GetTile, x, y)
+    if ok and t then return t end
+    return nil
+end
+
+local function flagsOf(t)
+    local f = tonumber(tf(t, "flags")) or 0
+    return math.tointeger(f) or 0
+end
+
+local function itemInfo(id)
+    for _, fn in ipairs({ "GetItemInfoByID", "GetItemByIDSafe", "GetItemInfo" }) do
+        local f = _G[fn]
+        if type(f) == "function" then
+            local ok, info = pcall(f, id)
+            if ok and info then return info end
+        end
+    end
+    return nil
+end
+
+local function itemName(id)
+    local info = itemInfo(id)
+    if info then
+        local n = tf(info, "name")
+        if type(n) == "string" then return n end
+    end
+    return nil
+end
+
+local colCache = {}
+local function collisionOf(fg)                    -- number, or false if the executor can't tell
+    local v = colCache[fg]
+    if v == nil then
+        v = false
+        local info = itemInfo(fg)
+        if info then
+            for _, key in ipairs({ "collision_type", "collisionType", "collision" }) do
+                local n = tf(info, key)
+                if type(n) == "number" then v = n break end
+            end
+        end
+        colCache[fg] = v
+    end
+    return v
+end
+
+-- A tile you can walk through: air, or a block with no collision / a platform.
+local function fgPassable(fg)
+    if fg == 0 then return true end
+    local c = collisionOf(fg)
+    return c == 0 or c == 2
+end
+
+-- A tile that holds you up when it is under your feet.
+local function fgSolid(fg)
+    if fg == 0 then return false end
+    return collisionOf(fg) ~= 0                   -- unknown (false) counts as solid
+end
+
+local function fgAt(x, y) return S.fg[idx(x, y)] or 0 end
+
+local function isPass(x, y)
+    if not inb(x, y) then return false end
+    if S.chargerAt[idx(x, y)] then return false end
+    return fgPassable(fgAt(x, y))
+end
+
+local function isGrounded(x, y)
+    if y + 1 >= WORLD_H then return true end
+    return fgSolid(fgAt(x, y + 1))
+end
+
+---------------- TILE SIGNATURE (empty / filled) ------
+local EXTRA_KEYS = { "extra", "extraData", "extradata", "tiledata", "data" }
+
+local function hex(s)
+    return (s:sub(1, 32):gsub(".", function(ch) return string.format("%02x", ch:byte()) end))
+end
+
+local function valStr(v)
+    local tv = type(v)
+    if tv == "string" then
+        if v:find("[^%g ]") then return hex(v) end
+        return v
+    elseif tv == "number" or tv == "boolean" then
+        return tostring(v)
+    end
+    return nil
+end
+
+local function sigOf(t, flags)
+    local parts = { "f" .. (flags & (~FLAG_FLIPPED)) }
+    for _, key in ipairs(EXTRA_KEYS) do
+        local v = tf(t, key)
+        if type(v) == "table" then
+            local items = {}
+            pcall(function()
+                for k, x in pairs(v) do
+                    if k == "growth" then
+                        -- a unix time (> 1e9) means the server stamped this tile recently; a small number means it was not
+                        local gn = tonumber(x)
+                        if gn then items[#items + 1] = "g:" .. (gn > 1e9 and "T" or "S") end
+                    elseif k ~= "lastupdate" then
+                        local s = valStr(x)
+                        if s then items[#items + 1] = tostring(k) .. ":" .. s end
+                    end
+                end
+            end)
+            table.sort(items)
+            if #items > 0 then parts[#parts + 1] = key .. "{" .. table.concat(items, ",") .. "}" end
+        else
+            local s = valStr(v)
+            if s then parts[#parts + 1] = key .. "=" .. s end
+        end
+    end
+    return (table.concat(parts, ";"):gsub("[~\r\n]", "_"))
+end
+
+local function inspectTile(t)                     -- everything we can see on a tile, for the console
+    local out = {}
+    pcall(function()
+        if type(t) == "table" then
+            for k, v in pairs(t) do
+                out[#out + 1] = tostring(k) .. "=" .. (type(v) == "table" and "{table}" or tostring(v))
+            end
+        end
+    end)
+    for _, key in ipairs({ "fg", "bg", "flags", "extra", "extraData", "data", "state", "label" }) do
+        local v = tf(t, key)
+        if v ~= nil then out[#out + 1] = "[" .. key .. "]=" .. (type(v) == "table" and "{table}" or tostring(v)) end
+    end
+    table.sort(out)
+    return table.concat(out, " ")
+end
+
+local function refreshCharger(c)
+    local t = getTile(c.x, c.y)
+    if not t then return end
+    c.flags = flagsOf(t)
+end
+
+---------------- SCAN WORLD ---------------------------
+local function scanWorld()
+    -- world size, if the executor knows it
+    pcall(function()
+        local w = GetWorld()
+        local ww, hh = tonumber(w.width), tonumber(w.height)
+        if ww and hh and ww >= 20 and hh >= 20 and ww <= 400 and hh <= 400 then
+            WORLD_W, WORLD_H = math.floor(ww), math.floor(hh)
+        end
+    end)
+
+    -- A Geiger Charger = any block (fg > 0) that has the chosen wallpaper (bg) behind it.
+    local fg, wpTiles = {}, {}
+    local wp = cfg.wallpaperId
+    for y = 0, WORLD_H - 1 do
+        for x = 0, WORLD_W - 1 do
+            local t = getTile(x, y)
+            local id = t and tonumber(tf(t, "fg")) or 0
+            fg[idx(x, y)] = id
+            if wp > 0 and id > 0 and t then
+                local bg = tonumber(tf(t, "bg")) or 0
+                if bg == wp then wpTiles[#wpTiles + 1] = idx(x, y) end
+            end
+        end
+    end
+    S.fg = fg
+
+    local id = wp
+
+    local list, at = {}, {}
+    if id > 0 then
+        for _, k in ipairs(wpTiles) do
+            local x, y = k % WORLD_W, k // WORLD_W
+            local t = getTile(x, y)
+            local flags = t and flagsOf(t) or 0
+            local c = { x = x, y = y, key = k, flags = flags }
+            list[#list + 1] = c
+            at[k] = c
+        end
+    end
+    S.chargers, S.chargerAt = list, at
+    return id, #list
+end
+
+---------------- PATH SEARCH (own BFS over walkable tiles) --
+local DX, DY = { 1, -1, 0, 0 }, { 0, 0, 1, -1 }
+
+local function bfs(sx, sy)                        -- parent map for every tile reachable from (sx, sy)
+    local par = {}
+    local start = idx(sx, sy)
+    par[start] = -1
+    local q, h, tl = { start }, 1, 1
+    while h <= tl do
+        local cur = q[h]
+        h = h + 1
+        local cx, cy = cur % WORLD_W, cur // WORLD_W
+        for i = 1, 4 do
+            local nx, ny = cx + DX[i], cy + DY[i]
+            if isPass(nx, ny) then
+                local k = idx(nx, ny)
+                if par[k] == nil then
+                    par[k] = cur
+                    tl = tl + 1
+                    q[tl] = k
+                end
+            end
+        end
+    end
+    return par
+end
+
+local function pathTo(par, tx, ty)
+    local k = idx(tx, ty)
+    if par[k] == nil then return nil end
+    local rev = {}
+    while par[k] ~= -1 do
+        rev[#rev + 1] = { x = k % WORLD_W, y = k // WORLD_W }
+        k = par[k]
+    end
+    local path = {}
+    for i = #rev, 1, -1 do path[#path + 1] = rev[i] end
+    return path
+end
+
+---------------- WALKING ------------------------------
+-- One hop with the game's pathfinder. Waits until we arrive or stop moving.
+local function hop(nx, ny)
+    local sx, sy = myTile()
+    pcall(rawFindPath, nx, ny)
+    local lastx, lasty, still = sx, sy, 0
+    for _ = 1, 25 do
+        if not S.running then break end
+        nap(100)
+        local cx, cy = myTile()
+        if cx == nx and cy == ny then return true end
+        if cx == lastx and cy == lasty then still = still + 1 else still = 0 end
+        lastx, lasty = cx, cy
+        if still >= 4 then break end
+    end
+    local ex, ey = myTile()
+    return ex ~= sx or ey ~= sy
+end
+
+-- Human-like speed. The anti-cheat compares how far you moved with the time since your last move,
+-- so after every hop we wait about msPerTile for each tile just moved.
+local function pace(tiles)
+    local wait = math.max(cfg.stepDelay, (tiles or 0) * cfg.msPerTile)
+    if wait <= 0 then return end                  -- 0 = no wait at all
+    nap(wait + math.random(0, 150))
+end
+
+-- Shrinks a move so its real length is <= stepTiles.
+local function limitStep(dx, dy)
+    local len  = math.sqrt(dx * dx + dy * dy)
+    local step = math.max(1, cfg.stepTiles)
+    if len <= step then return dx, dy end
+    local f  = step / len
+    local mx = math.floor(math.abs(dx) * f) * (dx < 0 and -1 or 1)
+    local my = math.floor(math.abs(dy) * f) * (dy < 0 and -1 or 1)
+    if mx == 0 and my == 0 then
+        if math.abs(dx) >= math.abs(dy) then mx = (dx < 0) and -1 or 1
+        else my = (dy < 0) and -1 or 1 end
+    end
+    return mx, my
+end
+
+-- Used when my own map has no route: small paced steps toward the target (never one long jump).
+local function stepToward(tx, ty)
+    local stuck = 0
+    for _ = 1, 400 do
+        if not S.running then return false end
+        local cx, cy = myTile()
+        if cx == nil then return false end
+        local dx, dy = tx - cx, ty - cy
+        if dx == 0 and dy == 0 then return true end
+        local mx, my = limitStep(dx, dy)
+        if stuck > 0 then
+            mx = (mx > 0) and 1 or ((mx < 0) and -1 or 0)
+            my = (my > 0) and 1 or ((my < 0) and -1 or 0)
+        end
+        if hop(cx + mx, cy + my) then
+            stuck = 0
+            pace(math.max(math.abs(mx), math.abs(my)))
+        else
+            stuck = stuck + 1
+            if stuck >= 3 then return false end
+            nap(300)
+        end
+    end
+    return false
+end
+
+-- Walks to (tx, ty) along walkable tiles, at most stepTiles per hop, at a human pace.
+local function walkTo(tx, ty)
+    if type(rawFindPath) ~= "function" then return false end
+    for _ = 1, 3 do
+        if not S.running then return false end
+        local cx, cy = myTile()
+        if cx == nil then return false end
+        if cx == tx and cy == ty then return true end
+
+        local path = pathTo(bfs(cx, cy), tx, ty)
+        if path then
+            local i, broken = 0, false
+            while i < #path and S.running do
+                local j = math.min(#path, i + cfg.stepTiles)
+                local k = j
+                while k > i + 1 and not isGrounded(path[k].x, path[k].y) do k = k - 1 end
+                if not isGrounded(path[k].x, path[k].y) then k = j end
+                local fx, fy = myTile()
+                if not hop(path[k].x, path[k].y) then broken = true break end
+                local ax, ay = myTile()
+                local moved = (fx and ax) and math.max(math.abs(ax - fx), math.abs(ay - fy)) or (k - i)
+                i = k
+                pace(moved)
+            end
+            if not broken then
+                local ax, ay = myTile()
+                if ax == tx and ay == ty then return true end
+            end
+        else
+            if stepToward(tx, ty) then return true end
+        end
+        nap(300)
+    end
+    return false
+end
+
+-- The game's own pathfinder in one go: it walks the whole route by itself, so it works from far away
+-- and where my own map has no route. It is fast, so it is only the fallback (and used for the drop trip).
+local function goDirect(tx, ty)
+    if type(rawFindPath) ~= "function" then return false end
+    local cx, cy = myTile()
+    if cx == nil then return false end
+    if cx == tx and cy == ty then return true end
+    local dist = math.abs(tx - cx) + math.abs(ty - cy)
+    pcall(rawFindPath, tx, ty)
+    local lastx, lasty, still = cx, cy, 0
+    for _ = 1, math.max(40, dist * 10) do        -- about 1 second per tile, at most
+        if not S.running then return false end
+        nap(100)
+        local x, y = myTile()
+        if x == tx and y == ty then return true end
+        if x == lastx and y == lasty then still = still + 1 else still = 0 end
+        lastx, lasty = x, y
+        if still >= 20 then break end            -- 2 seconds without moving: it is not going anywhere
+    end
+    local x, y = myTile()
+    return x == tx and y == ty
+end
+
+-- Long trips where my own map has no route (gates, entrances, odd tiles) or the route needs real jump
+-- physics: the game's pathfinder, but only for SHORT hops along the straight line to the target, each
+-- followed by the normal pace wait. It never asks the game for one long run, so it never looks like a jump.
+local function chunkWalk(tx, ty)
+    if type(rawFindPath) ~= "function" then return false end
+    local fails = 0
+    for _ = 1, 800 do
+        if not S.running then return false end
+        local cx, cy = myTile()
+        if cx == nil then return false end
+        local dx, dy = tx - cx, ty - cy
+        if dx == 0 and dy == 0 then return true end
+        local len = math.sqrt(dx * dx + dy * dy)
+        local hopLen = math.max(2, cfg.stepTiles)
+        local wx, wy = tx, ty
+        if len > hopLen then
+            local f = hopLen / len
+            wx = cx + math.floor(dx * f + (dx >= 0 and 0.5 or -0.5))
+            wy = cy + math.floor(dy * f + (dy >= 0 and 0.5 or -0.5))
+        end
+        -- the line point first, then open tiles with ground under them around it that are closer to the target
+        local cands = { { wx, wy } }
+        if wx ~= tx or wy ~= ty then
+            for r = 1, 3 do
+                for ox = -r, r do
+                    for oy = -r, r do
+                        if math.max(math.abs(ox), math.abs(oy)) == r then
+                            local x, y = wx + ox, wy + oy
+                            if inb(x, y) and isPass(x, y) and isGrounded(x, y)
+                               and math.sqrt((tx - x) ^ 2 + (ty - y) ^ 2) < len then
+                                cands[#cands + 1] = { x, y }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        local moved = false
+        for i = 1, math.min(#cands, 6) do
+            if not S.running then return false end
+            local bx, by = myTile()
+            if hop(cands[i][1], cands[i][2]) then
+                local ax, ay = myTile()
+                local steps = (bx and ax) and math.max(math.abs(ax - bx), math.abs(ay - by)) or 1
+                if steps > 0 then
+                    moved = true
+                    pace(steps)
+                    break
+                end
+            end
+        end
+        if moved then fails = 0 else
+            fails = fails + 1
+            if fails >= 3 then return false end
+            nap(300)
+        end
+    end
+    local x, y = myTile()
+    return x == tx and y == ty
+end
+
+local function whyNoRoute(tx, ty)
+    local cx, cy = myTile()
+    if not cx then return end
+    local par = bfs(cx, cy)
+    local n = 0
+    for _ in pairs(par) do n = n + 1 end
+    say(string.format("`8[Auto Charger] no safe route: you (%d,%d) -> (%d,%d), distance %d | target open in my map: %s, connected to you: %s, ground under it: %s | tiles I can walk: %d",
+        cx, cy, tx, ty, math.max(math.abs(tx - cx), math.abs(ty - cy)),
+        tostring(isPass(tx, ty)), tostring(par[idx(tx, ty)] ~= nil), tostring(isGrounded(tx, ty)), n))
+end
+
+-- Any trip: my own paced path first, then short paced hops with the game's pathfinder. The one-shot
+-- jump (goDirect) only if you turned "allow jump" on.
+local function travelTo(tx, ty)
+    if walkTo(tx, ty) then return true end
+    if not S.running then return false end
+    if chunkWalk(tx, ty) then return true end
+    if not S.running then return false end
+    whyNoRoute(tx, ty)
+    if cfg.allowJump then
+        say("`4[Auto Charger] `wNo safe route - using ONE long jump (can trip the speed-hack check).")
+        return goDirect(tx, ty)
+    end
+    return false
+end
+
+---------------- PLAN THE STOPS ------------------------
+-- Picks the fewest standing tiles that cover every charger within `reach`.
+local function planStands(filter)
+    local RX = math.max(0, math.floor(cfg.reachX))
+    local RY = math.max(0, math.floor(cfg.reachY))
+    local cx, cy = myTile()
+    cx, cy = cx or 0, cy or 0
+    local par = bfs(cx, cy)
+    local nPar = 0
+    for _ in pairs(par) do nPar = nPar + 1 end
+    local D = { reached = nPar, notPass = 0, notGround = 0, notConn = 0, ok = 0, loose = 0 }
+
+    local targets, uncovered, uncoveredN = {}, {}, 0
+    for _, c in ipairs(S.chargers) do
+        if not filter or filter(c) then
+            targets[#targets + 1] = c
+            uncovered[c.key] = c
+            uncoveredN = uncoveredN + 1
+        end
+    end
+
+    local stands = {}
+
+    -- one greedy pass. strict = only tiles my own map can walk to.
+    -- loose = any free tile with ground (the game's pathfinder does the walking).
+    local function pass(loose, onlyTop)
+        if uncoveredN == 0 then return end
+        local cand, candAt, cnt = {}, {}, {}
+        for _, c in ipairs(targets) do
+            if uncovered[c.key] then
+                for dy = -RY, RY do
+                    for dx = -RX, RX do
+                        local x, y = c.x + dx, c.y + dy
+                        if inb(x, y) and inR(dx, dy) then
+                            local k = idx(x, y)
+                            if candAt[k] == nil then
+                                local ok = false
+                                if onlyTop and not S.chargerAt[idx(x, y + 1)] then
+                                    -- not on top of a charger: skip this tile in the stand-on-top pass
+                                elseif not isPass(x, y) then
+                                    if not loose then D.notPass = D.notPass + 1 end
+                                elseif not isGrounded(x, y) then
+                                    if not loose then D.notGround = D.notGround + 1 end
+                                elseif par[k] == nil and not loose then
+                                    D.notConn = D.notConn + 1
+                                else
+                                    ok = true
+                                end
+                                candAt[k] = ok and { x = x, y = y, k = k } or false
+                                if ok then
+                                    if not loose then D.ok = D.ok + 1 end
+                                    cand[#cand + 1] = candAt[k]
+                                    cnt[k] = 0
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for _, c in ipairs(targets) do
+            if uncovered[c.key] then
+                for dy = -RY, RY do
+                    for dx = -RX, RX do
+                        local x, y = c.x + dx, c.y + dy
+                        if inb(x, y) and inR(dx, dy) then
+                            local k = idx(x, y)
+                            if cnt[k] then cnt[k] = cnt[k] + 1 end
+                        end
+                    end
+                end
+            end
+        end
+
+        while uncoveredN > 0 do
+            local best, bestN = nil, 0
+            for _, s in ipairs(cand) do
+                local n = cnt[s.k]
+                if n > bestN then best, bestN = s, n end
+            end
+            if not best then break end
+
+            local list = {}
+            for dy = -RY, RY do
+                for dx = -RX, RX do
+                    local x, y = best.x + dx, best.y + dy
+                    if inb(x, y) and inR(dx, dy) then
+                        local c = uncovered[idx(x, y)]
+                        if c then
+                            list[#list + 1] = c
+                            uncovered[c.key] = nil
+                            uncoveredN = uncoveredN - 1
+                            for ddy = -RY, RY do
+                                for ddx = -RX, RX do
+                                    local ax, ay = c.x + ddx, c.y + ddy
+                                    if inb(ax, ay) and inR(ddx, ddy) then
+                                        local kk = idx(ax, ay)
+                                        if cnt[kk] then cnt[kk] = cnt[kk] - 1 end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            table.sort(list, function(a, b) if a.y ~= b.y then return a.y < b.y end return a.x < b.x end)
+            stands[#stands + 1] = { x = best.x, y = best.y, list = list, loose = loose }
+            if loose then D.loose = D.loose + 1 end
+        end
+    end
+
+    if cfg.standOnTop then pass(false, true) end  -- first choice: stand on top of a charger
+    pass(false, false)
+    if cfg.standOnTop then pass(true, true) end
+    pass(true, false)                             -- chargers my map can't connect to: let the game's pathfinder try
+    S.diag = D
+
+    if cfg.walkOrder == 2 or cfg.walkOrder == 3 then
+        -- two-sided layout: finish one whole side (top to bottom or bottom to top), then the other side
+        local minX, maxX = math.huge, -math.huge
+        for _, c in ipairs(S.chargers) do
+            if c.x < minX then minX = c.x end
+            if c.x > maxX then maxX = c.x end
+        end
+        local mid = (minX + maxX) / 2
+        local leftFirst = (cfg.walkOrder == 2)
+        local function sideRank(st)
+            local isLeft = st.x < mid
+            if leftFirst then return isLeft and 1 or 2 end
+            return isLeft and 2 or 1
+        end
+        local down = cfg.vertDown ~= false
+        table.sort(stands, function(p, q)
+            local sp, sq = sideRank(p), sideRank(q)
+            if sp ~= sq then return sp < sq end
+            if p.y ~= q.y then
+                if down then return p.y < q.y end
+                return p.y > q.y
+            end
+            return p.x < q.x
+        end)
+        S.stands, S.unreach = #stands, uncoveredN
+        return stands, uncoveredN
+    end
+
+    -- visit the stops in a short walking order (nearest next)
+    local ordered, rest = {}, {}
+    for i, s in ipairs(stands) do rest[i] = s end
+    local ox, oy = cx, cy
+    while #rest > 0 do
+        local bi, bd = 1, math.huge
+        for i, s in ipairs(rest) do
+            local d = math.abs(s.x - ox) + math.abs(s.y - oy)
+            if d < bd then bi, bd = i, d end
+        end
+        local s = table.remove(rest, bi)
+        ordered[#ordered + 1] = s
+        ox, oy = s.x, s.y
+    end
+
+    S.stands, S.unreach = #ordered, uncoveredN
+    return ordered, uncoveredN
+end
+
+local function printDiag()
+    local D = S.diag or {}
+    local px_, py_ = myTile()
+    local ids, known, unknown = {}, 0, 0
+    for _, id in pairs(S.fg) do
+        if id > 0 and not ids[id] then
+            ids[id] = true
+            if collisionOf(id) == false then unknown = unknown + 1 else known = known + 1 end
+        end
+    end
+    say(string.format("`4[Auto Charger] `wWhy no stop: you at (%s,%s), world %dx%d, %d chargers",
+        tostring(px_), tostring(py_), WORLD_W, WORLD_H, #S.chargers))
+    say(string.format("`8  tiles you can reach: %s | near chargers: blocked %s, no ground %s, not connected %s, usable %s",
+        tostring(D.reached), tostring(D.notPass), tostring(D.notGround), tostring(D.notConn), tostring(D.ok)))
+    say(string.format("`8  block types with known collision: %d, unknown: %d (unknown = treated as solid)", known, unknown))
+    if px_ then
+        local under = fgAt(px_, py_ + 1)
+        say(string.format("`8  under you: id %d, collision %s | your tile id %d", under, tostring(collisionOf(under)), fgAt(px_, py_)))
+    end
+    local c = S.chargers[1]
+    if c then say(string.format("`8  first charger (%d,%d), tile above id %d, below id %d, left id %d, right id %d",
+        c.x, c.y, fgAt(c.x, c.y - 1), fgAt(c.x, c.y + 1), fgAt(c.x - 1, c.y), fgAt(c.x + 1, c.y))) end
+end
+
+---------------- RAW PACKETS (same method as Auto Crystal) --
+local function rawPacket(value, tx, ty)
+    local x, y = 0, 0
+    pcall(function() local p = GetLocal().pos x, y = p.x, p.y end)
+    local pkt = {
+        type = 3, value = value, px = tx, py = ty,
+        x = x, y = y, xspeed = 0, yspeed = 0,
+        netid = 0, snetid = 0, state = 0,
+        padding1 = 0, padding2 = 0, padding4 = 0.0, padding5 = 0,
+        dropped = 0, extrasize = 0,
+    }
+    if S.template then
+        local keep = { type = true, value = true, px = true, py = true, x = true, y = true, netid = true }
+        for k, v in pairs(S.template) do
+            if not keep[k] then pkt[k] = v end
+        end
+    end
+    return pkt
+end
+
+local function send(pkt)
+    S.sending = true
+    local ok = pcall(SendPacketRaw, false, pkt)
+    S.sending = false
+    return ok
+end
+
+-- Punch: tile packet (value 18) then the punch state packet (copied from your dump).
+local function sendPunch(tx, ty)
+    local ok = send(rawPacket(PUNCH_ID, tx, ty))
+    if ok then
+        local sp = rawPacket(PUNCH_ID, tx, ty)
+        sp.type, sp.state, sp.value = 0, PUNCH_STATE, 0
+        send(sp)
+    end
+    return ok
+end
+
+-- Place a dead geiger: your dump shows the real client sends just the tile packet.
+local function sendPlace(tx, ty)
+    return send(rawPacket(cfg.deadId, tx, ty))
+end
+
+---------------- ACTIONS ------------------------------
+local function punch(c)                           -- true if a geiger came back into the inventory
+    local before = totalGeigers()
+    sendPunch(c.x, c.y)
+    local waited = 0
+    while S.running and waited < cfg.waitResultMs do
+        nap(100)
+        waited = waited + 100
+        local now = totalGeigers()
+        if before and now and now > before then return true end
+        if before == nil then return false end
+    end
+    return false
+end
+
+local function place(c)                           -- true if the dead geiger count dropped
+    local before = getItemCount(cfg.deadId)
+    sendPlace(c.x, c.y)
+    local waited = 0
+    while S.running and waited < cfg.waitResultMs do
+        nap(100)
+        waited = waited + 100
+        local now = getItemCount(cfg.deadId)
+        if before and now and now < before then return true end
+        if before == nil then return false end
+    end
+    return false
+end
+
+-- Alive geiger stack is full: walk to the drop spot, drop them all, then the caller walks back.
+-- If the tile is taken (the drop fails), it moves one tile left and tries again.
+-- Where to try dropping, best first: the drop spot you captured (and a few tiles to its left),
+-- then free tiles with ground under them around where I am standing now.
+local function dropTiles()
+    local list = {}
+    if cfg.dropX ~= 0 or cfg.dropY ~= 0 then
+        for sh = 0, 5 do list[#list + 1] = { x = math.max(0, cfg.dropX - sh), y = cfg.dropY, spot = true } end
+    end
+    local cx, cy = myTile()
+    if cx then
+        for r = 0, 8 do
+            for _, dx in ipairs(r == 0 and { 0 } or { -r, r }) do
+                local x = cx + dx
+                if inb(x, cy) and isPass(x, cy) and isGrounded(x, cy) then
+                    list[#list + 1] = { x = x, y = cy, spot = false }
+                end
+            end
+        end
+    end
+    return list
+end
+
+-- Alive geiger stack is full: drop it all, one tile at a time, until the game accepts a drop.
+local function dropAlive()
+    local before = getItemCount(cfg.aliveId)
+    if before == nil or before <= 0 then return true end
+    setStage("Dropping geigers", C.yellow)
+    local skipSpot = false
+    local tried = 0
+    for _, t in ipairs(dropTiles()) do
+        if not S.running then return false end
+        if t.spot and skipSpot then goto continue end
+        tried = tried + 1
+        if tried > 14 then break end
+
+        do
+            local mx, my = myTile()
+            if mx ~= t.x or my ~= t.y then
+                -- always the paced walker (short hops, msPerTile per tile). goDirect hands the whole
+                -- route to the game's pathfinder at once = an instant jump the speed-hack check flags.
+                local reached = travelTo(t.x, t.y)
+                if not reached then
+                    if t.spot then
+                        skipSpot = true
+                        say("`4[Auto Charger] `wCan't reach the drop spot (" .. t.x .. "," .. t.y .. "), trying near me.")
+                    end
+                    goto continue
+                end
+            end
+            nap(500)
+            local have = getItemCount(cfg.aliveId) or 0
+            if have <= 0 then return true end
+            S.cantDrop, S.lastOverlay = false, nil
+            SendPacket(2, "action|dialog_return\ndialog_name|drop\nitem_drop|" .. cfg.aliveId
+                .. "|\nitem_count|" .. have .. "\n")
+            local waited, dropped = 0, false
+            while S.running and waited < 2500 do
+                nap(250)
+                waited = waited + 250
+                local now = getItemCount(cfg.aliveId)
+                if now and now < have then dropped = true break end
+                if S.cantDrop then break end
+            end
+            if dropped then
+                local left = getItemCount(cfg.aliveId) or 0
+                S.dropped = S.dropped + (have - left)
+                if left <= 0 then
+                    say("`2[Auto Charger] `wDropped " .. have .. " alive geigers at (" .. t.x .. "," .. t.y .. ").")
+                    return true
+                end
+            else
+                say(string.format("`4[Auto Charger] `wDrop refused at (%d,%d): %s", t.x, t.y,
+                    tostring(S.lastOverlay or S.lastMsg or "no reply from the game")))
+            end
+        end
+        ::continue::
+    end
+    say("`4[Auto Charger] `wCouldn't drop the geigers anywhere near. Pick a drop spot with open floor next to it.")
+    return false
+end
+
+-- Out of dead geigers: walk to the take spot (paced, never an instant jump), stand on it so the dead
+-- geigers lying there are picked up, then walk back to the stop we came from.
+-- Returns true if the dead geiger count went up.
+local function takeDead()
+    if not cfg.takeOn or (cfg.takeX == 0 and cfg.takeY == 0) then return false end
+    if S.takeEmpty then return false end            -- already looked this run and found nothing
+    local sx, sy = S.curX, S.curY
+    local before = getItemCount(cfg.deadId) or 0
+    local best = before
+    setStage("Taking dead geigers", C.yellow)
+    -- items can land a tile or two away from where they were dropped, so also stand beside the spot
+    for n, off in ipairs({ 0, -1, 1, -2, 2 }) do
+        if not S.running then break end
+        local tx = math.max(0, cfg.takeX + off)
+        if not travelTo(tx, cfg.takeY) then
+            if off == 0 then
+                say("`4[Auto Charger] `wCan't reach the take spot (" .. cfg.takeX .. "," .. cfg.takeY .. ").")
+                break
+            end
+        else
+            local waited, limit = 0, (best > before) and 1000 or ((n == 1) and 3000 or 1500)
+            while S.running and waited < limit do
+                nap(250)
+                waited = waited + 250
+                local now = getItemCount(cfg.deadId) or 0
+                if now > best then best, waited = now, 0 end   -- still picking up: keep waiting
+            end
+        end
+    end
+    local after = getItemCount(cfg.deadId) or 0
+    if after > before then
+        S.taken = S.taken + (after - before)
+        say("`2[Auto Charger] `wTook " .. (after - before) .. " dead geigers at the take spot.")
+    else
+        S.takeEmpty = true
+        say("`4[Auto Charger] `wNo dead geigers at the take spot (" .. cfg.takeX .. "," .. cfg.takeY .. ").")
+    end
+    if sx and S.running then travelTo(sx, sy) end      -- back to the chargers
+    return after > before
+end
+
+-- Remembers chargers that did not get handled, so the end of the run can list them.
+local function noteMiss(c, why)
+    S.miss = S.miss or {}
+    S.miss[#S.miss + 1] = string.format("(%d,%d) %s", c.x, c.y, why)
+end
+
+local function doRetrieve(c)
+    if cfg.dropOn then                            -- no room to pick up: drop the alive geigers first
+        local have = getItemCount(cfg.aliveId)
+        if have and have >= cfg.fullAt then
+            local sx, sy = S.curX, S.curY
+            if not dropAlive() then
+                if S.running then say("`4[Auto Charger] `wStopping: the alive geiger stack is full and I can't drop it.") end
+                S.running = false
+                return "stopped"
+            end
+            if sx and S.running then                        -- back to where the chargers are (paced, no jump)
+                travelTo(sx, sy)
+            end
+        end
+    end
+    if not S.running then return "stopped" end
+    S.lastMsg = nil
+    setStage("Retrieving", C.green)
+    if punch(c) then
+        S.retrieved = S.retrieved + 1
+        nap(cfg.actionDelay)
+        return "ok"
+    end
+    S.nothing = S.nothing + 1                     -- nothing came out (it was empty / charging)
+    return "nothing"
+end
+
+local function doCharge(c)
+    local dead = getItemCount(cfg.deadId)
+    if dead ~= nil and dead <= 0 then
+        if takeDead() then dead = getItemCount(cfg.deadId) end   -- fetched more from the take spot
+        if dead ~= nil and dead <= 0 then return "nodead" end
+    end
+    setStage("Charging", C.cyan)
+    if place(c) then
+        S.charged = S.charged + 1
+        nap(cfg.actionDelay)
+        return "ok"
+    end
+    S.skipped = S.skipped + 1                     -- refused (already full / charging)
+    return "failed"
+end
+
+---------------- MAIN LOOP ----------------------------
+local function ensureWorld()
+    local target = norm(cfg.world)
+    if target == "" then return true end
+    local tries = 0
+    while S.running and curWorld() ~= target do
+        if tries >= 4 then say("`4[Auto Charger] `wCould not reach " .. cfg.world) return false end
+        tries = tries + 1
+        setStage("Warping to " .. cfg.world, C.yellow)
+        SendPacket(2, "action|input\n|text|/warp " .. cfg.world .. "\n")
+        nap(6000)
+    end
+    if S.running then nap(2500) end               -- let the world finish loading
+    return S.running
+end
+
+-- Walks to a stop, then runs fn on every charger in reach from there.
+local function visit(st, fn)
+    setStage("Moving", C.cyan)
+    if not travelTo(st.x, st.y) then
+        S.failed = S.failed + #st.list
+        S.step = S.step + #st.list
+        for _, c in ipairs(st.list) do noteMiss(c, "stop not reachable") end
+        say(string.format("`4[Auto Charger] `wCan't reach stop (%d,%d), skipping %d charger(s).", st.x, st.y, #st.list))
+        return nil
+    end
+    S.curX, S.curY = st.x, st.y
+    S.stopN = (S.stopN or 0) + 1
+    say(string.format("`8[Auto Charger] stop %d at (%d,%d): %d chargers | charged %d, taken %d, refused %d",
+        S.stopN, st.x, st.y, #st.list, S.charged or 0, S.retrieved or 0, S.skipped or 0))
+    for _, c in ipairs(st.list) do
+        if not S.running then return "stopped" end
+        local r = fn(c)
+        if r == "nodead" then return "nodead" end
+    end
+    return nil
+end
+
+-- Visits only chargers that want(c) says need work. After every stop it re-plans from where you
+-- stand, so chargers learned to be empty / charging meanwhile are not walked to.
+local function sweep(want, act)
+    for _, c in ipairs(S.chargers) do refreshCharger(c) end
+    local done = {}
+    while S.running do
+        local stands = planStands(function(c) return not done[c.key] and want(c) end)
+        if #stands == 0 then break end
+        local st = stands[1]
+        local r = visit(st, act)
+        for _, c in ipairs(st.list) do done[c.key] = true end
+        if r == "nodead" then saveConfig(true) return "nodead" end
+    end
+    saveConfig(true)
+    return nil
+end
+
+local function runOnce()
+    if not ensureWorld() then return false end
+
+    setStage("Scanning area", C.cyan)
+    local id, n = scanWorld()
+    if id <= 0 then say("`4[Auto Charger] `wWallpaper id not set. Use Learn wallpaper (Tools tab) or type the id.") return false end
+    if n == 0 then say("`4[Auto Charger] `wNo Geiger Chargers found (no block with wallpaper " .. id .. " behind it).") return false end
+
+    S.miss = {}
+    S.stopN = 0
+    S.takeEmpty = false
+    setStage("Planning route", C.cyan)
+    local stands, unreach = planStands()
+    S.unreachFirst = unreach
+    if #stands == 0 then
+        say("`4[Auto Charger] `wNo reachable standing tile next to any charger.")
+        printDiag()
+        return false
+    end
+    say(string.format("`2[Auto Charger] `w%d chargers -> %d stops (%d unreachable).", n, #stands, unreach))
+    if S.diag and S.diag.loose > 0 then
+        say(string.format("`2[Auto Charger] `w%d stop(s) use the game's pathfinder (my own map can't connect them).", S.diag.loose))
+    end
+
+    local doRet = cfg.mode == 1 or cfg.mode == 3
+    local doChg = cfg.mode == 2 or cfg.mode == 3
+    S.step = 0
+
+    local function everyCharger() return true end
+
+    if doRet and doChg and cfg.perCharger then
+        S.stepsTotal = n
+        local noDead = false
+        sweep(everyCharger, function(c)
+            doRetrieve(c)
+            if not noDead and doCharge(c) == "nodead" then
+                noDead = true
+                say("`2[Auto Charger] `wNo dead geigers left, only retrieving now.")
+            end
+            S.step = math.min(S.stepsTotal, S.step + 1)
+        end)
+        S.step = S.stepsTotal
+    else
+        S.stepsTotal = n * ((doRet and 1 or 0) + (doChg and 1 or 0))
+        if doRet then
+            sweep(everyCharger, function(c) doRetrieve(c) S.step = math.min(S.stepsTotal, S.step + 1) end)
+            S.step = n
+        end
+        if doChg and S.running then
+            local r = sweep(everyCharger, function(c)
+                local res = doCharge(c)
+                S.step = math.min(S.stepsTotal, S.step + 1)
+                return res
+            end)
+            if r == "nodead" then say("`2[Auto Charger] `wNo dead geigers left.") end
+            S.step = S.stepsTotal
+        end
+    end
+
+    say(string.format("`2[Auto Charger] `wRun done: charged %d, taken %d, already full/charging %d, nothing came out %d",
+        S.charged or 0, S.retrieved or 0, S.skipped or 0, S.nothing or 0))
+
+    -- Summary: which chargers were not handled and why (also counts chargers no stop could cover)
+    if S.unreachFirst and S.unreachFirst > 0 then
+        say("`4[Auto Charger] `w" .. S.unreachFirst .. " charger(s) had NO standing tile within reach (blocked / no ground). Try a lower reach.")
+    end
+    if S.miss and #S.miss > 0 then
+        say("`4[Auto Charger] `wMissed / unclear (" .. #S.miss .. "): `9" .. table.concat(S.miss, "  ", 1, math.min(#S.miss, 12))
+            .. (#S.miss > 12 and ("  ... +" .. (#S.miss - 12)) or ""))
+    end
+    return true
+end
+
+local function mainLoop()
+    repeat
+        S.runs = S.runs + 1
+        local ok = runOnce()
+        if not ok or not S.running then break end
+        if cfg.repeatMin <= 0 then break end
+        local untilT = os.time() + cfg.repeatMin * 60
+        while S.running and os.time() < untilT do
+            setStage("Next run in " .. (untilT - os.time()) .. "s", C.gray)
+            nap(1000)
+        end
+    until not S.running
+end
+
+local function stopRun(reason)
+    if not S.running then return end
+    S.running = false
+    setStage("Stopping", C.yellow)
+    say("`4[Auto Charger] Stopped: `w" .. (reason or "stopped by user."))
+end
+
+local function startRun()
+    if S.threadAlive or S.scanning then setMsg("Busy, try again in a second.", false) return end
+    if type(SendPacketRaw) ~= "function" then setMsg("SendPacketRaw not found in this executor.", false) return end
+    if cfg.dropOn and cfg.mode ~= 2 and cfg.dropX == 0 and cfg.dropY == 0 then
+        setMsg("Set the drop spot first (Main tab) or turn drop OFF.", false)
+        return
+    end
+    if cfg.takeOn and cfg.mode ~= 1 and cfg.takeX == 0 and cfg.takeY == 0 then
+        say("`4[Auto Charger] `wTip: no take spot set (Main tab) - it will stop when the dead geigers run out.")
+    end
+    if not S.template then
+        say("`4[Auto Charger] `wTip: punch a tile by hand once first so the script can copy a real packet.")
+    end
+    saveConfig(true)
+    S.running, S.threadAlive = true, true
+    setStage("Starting", C.green)
+    say("`2[Auto Charger] `wStarted: " .. MODES[cfg.mode])
+    RunThread(function()
+        local ok, err = pcall(mainLoop)
+        if not ok then say("`4[Auto Charger] `wError: " .. tostring(err)) end
+        saveConfig(true)
+        S.running, S.threadAlive = false, false
+        setStage("Idle", C.white)
+    end)
+end
+
+-- "Scan area" button: scan + plan, without moving.
+local function startScan()
+    if S.scanning or S.threadAlive then return end
+    S.scanning = true
+    RunThread(function()
+        local ok, err = pcall(function()
+            local id, n = scanWorld()
+            if id <= 0 then setMsg("Wallpaper id not set - learn it or type it in (Tools tab).", false) return end
+            if n == 0 then setMsg("No chargers found (no wallpaper " .. id .. " behind a block).", false) return end
+            local _, unreach = planStands()
+            if S.stands == 0 then printDiag() end
+            setMsg(n .. " chargers, " .. S.stands .. " stops, " .. unreach .. " unreachable", unreach == 0)
+        end)
+        S.scanning = false
+        if not ok then setMsg("Scan failed: " .. tostring(err), false) end
+    end)
+end
+
+local DUMP_PATHS = { "C:/Users/benwo/AppData/Local/Growtopia/autocharger_dump.txt",
+                     "autocharger_dump.txt", "scripts/autocharger_dump.txt", "/sdcard/autocharger_dump.txt" }
+
+-- Writes (or appends) text to the dump file, trying the same folders as the config.
+local function writeFile(text, append)
+    local order = {}
+    if S.dumpPath then order[1] = S.dumpPath end
+    for _, pth in ipairs(DUMP_PATHS) do order[#order + 1] = pth end
+    for _, pth in ipairs(order) do
+        local ok, f = pcall(io.open, pth, append and "a" or "w")
+        if ok and f then
+            if pcall(function() f:write(text) f:close() end) then
+                S.dumpPath = pth
+                return pth
+            end
+        end
+    end
+    return nil
+end
+
+-- "Dump to file": everything the script can see about the chargers, for finding what tells
+-- empty / charging / full apart. Runs in its own thread so the game does not freeze.
+local function dumpChargers()
+    RunThread(function()
+        local ok, err = pcall(function()
+            if #S.chargers == 0 then scanWorld() end
+            local out = {}
+            local function add(line) out[#out + 1] = line end
+            local px_, py_ = myTile()
+            add("AUTO CHARGER DUMP  " .. os.date("%Y-%m-%d %H:%M:%S"))
+            add(string.format("world %s  size %dx%d  you at %s,%s", curWorld(), WORLD_W, WORLD_H, tostring(px_), tostring(py_)))
+            add(string.format("wallpaper id %d  chargers found %d", cfg.wallpaperId, #S.chargers))
+            add("last server text: " .. tostring(S.lastMsg or "-"))
+            add("")
+            add("ALL CHARGERS (x,y)")
+            local rows = {}
+            for _, c in ipairs(S.chargers) do rows[#rows + 1] = string.format("%d,%d", c.x, c.y) end
+            table.sort(rows)
+            for _, r in ipairs(rows) do add(r) end
+            add("")
+            local path = writeFile(table.concat(out, "\n") .. "\n", false)
+            if path then
+                setMsg("Dump saved to " .. path, true)
+                say("`2[Auto Charger] `wDump saved to `9" .. path .. " `w(" .. #S.chargers .. " chargers)")
+            else
+                setMsg("Could not write the dump file", false)
+                say("`4[Auto Charger] `wCould not write a dump file (no writable folder).")
+            end
+        end)
+        if not ok then setMsg("Dump failed: " .. tostring(err), false) end
+    end)
+end
+
+---------------- HOOKS --------------------------------
+local function register(events, hookName, fn)
+    local owner = nil
+    for i, ev in ipairs(events) do
+        local wrapped = function(...)
+            if owner == nil then owner = i end
+            if owner ~= i then return false end
+            return fn(...)
+        end
+        pcall(AddHook, ev, hookName .. i, wrapped)
+    end
+end
+
+local function learnFromTile(x, y)
+    S.learnPunch = false
+    local t = getTile(x, y)
+    local id = t and tonumber(tf(t, "bg")) or 0     -- the wallpaper behind the tile you punched
+    if id > 0 then
+        cfg.wallpaperId = id
+        setMsg("Wallpaper id = " .. id .. (itemName(id) and (" (" .. itemName(id) .. ")") or ""), true)
+        say("`2[Auto Charger] `wLearned wallpaper id `9" .. id .. " `wat (" .. x .. "," .. y .. ")")
+    else
+        setMsg("No wallpaper behind that tile - punch a charger with the wallpaper.", false)
+    end
+end
+
+local TEMPLATE_FIELDS = { "type", "value", "px", "py", "x", "y", "xspeed", "yspeed",
+    "netid", "snetid", "state", "padding1", "padding2", "padding4", "padding5",
+    "dropped", "extrasize" }
+
+local function onSendRaw(pkt)                     -- copy a real hand-sent tile packet / learn the charger id
+    if S.sending then return false end
+    local ok, t = pcall(function() return pkt.type end)
+    if not ok or t ~= 3 then return false end
+    if S.learnPunch then
+        local okv, v = pcall(function() return pkt.value end)
+        if okv and (v == PUNCH_ID or v == cfg.deadId) then
+            local okx, tx, ty = pcall(function() return pkt.px, pkt.py end)
+            if okx and tx and ty then learnFromTile(tx, ty) end
+        end
+    end
+    local copy = {}
+    for _, k in ipairs(TEMPLATE_FIELDS) do
+        local okf, v = pcall(function() return pkt[k] end)
+        if okf and v ~= nil then copy[k] = v end
+    end
+    S.template = copy
+    return false
+end
+
+-- Diagnostics only: prints every field of the next tile-update packet (type 5).
+local function onTankUpdate(pkt)
+    if not S.capturePkt then return false end
+    local ok, t = pcall(function() return pkt.type end)
+    if not ok or t ~= 5 then return false end
+    S.capturePkt = false
+    local parts = {}
+    pcall(function()
+        if type(pkt) == "table" then
+            for k, v in pairs(pkt) do
+                parts[#parts + 1] = tostring(k) .. "=" .. (type(v) == "table" and "{table}" or tostring(v))
+            end
+        end
+    end)
+    for _, key in ipairs({ "tilex", "tiley", "extDataSize", "extdata", "extData", "extra", "data" }) do
+        local v = tf(pkt, key)
+        if v ~= nil then
+            parts[#parts + 1] = "[" .. key .. "]=" .. (type(v) == "table" and "{table}" or tostring(v))
+        end
+    end
+    table.sort(parts)
+    say("`2[Auto Charger] `wTile update packet: `9" .. table.concat(parts, " "))
+    local wrote = writeFile("TILE UPDATE PACKET " .. os.date("%H:%M:%S") .. ": " .. table.concat(parts, " ") .. "\n", true)
+    setMsg(wrote and ("Tile update added to " .. wrote) or "Tile update captured - see the console.", true)
+    return false
+end
+
+register({ "onsendpacketraw", "OnSendPacketRaw" }, "ach_raw", onSendRaw)
+register({ "onprocesstankupdatepacket", "OnProcessTankUpdatePacket" }, "ach_tank", onTankUpdate)
+
+-- Remembers the last chat / bubble text so a failed punch can show what the server said.
+local function onVariant(var)
+    local ok, name = pcall(function() return tostring(var[0] or "") end)
+    if not ok then return false end
+    if name == "OnTextOverlay" then
+        local okt, txt = pcall(function() return tostring(var[1] or "") end)
+        if okt then
+            txt = (txt:gsub("`.", ""))
+            S.lastOverlay = txt
+            if txt:find("can't drop", 1, true) or txt:find("cannot drop", 1, true) or txt:find("no room", 1, true) then
+                S.cantDrop = true
+            end
+        end
+        return false
+    end
+    if name == "OnConsoleMessage" or name == "OnTalkBubble" then
+        local okt, txt = pcall(function() return tostring(var[name == "OnTalkBubble" and 2 or 1] or "") end)
+        if okt then
+            txt = (txt:gsub("`.", ""))
+            if txt:find("can't drop", 1, true) or txt:find("cannot drop", 1, true) then S.cantDrop = true S.lastOverlay = txt end
+            local chat = txt:find("CP:%d") or txt:find("%*%*") or txt:find("^%[") or txt:find("<")
+            if not chat and not txt:find("Auto Charger", 1, true) then S.lastMsg = txt end
+        end
+    end
+    return false
+end
+register({ "onvariant", "OnVariant" }, "ach_var", onVariant)
+
+---------------- MENU ---------------------------------
+local DEFAULTS = {}
+for _, k in ipairs(SAVE_KEYS) do DEFAULTS[k] = cfg[k] end
+
+local tab  = 1
+local TABS = { "Main", "Options", "Tools" }
+
+local function intInput(label, key, min, max)
+    local _, v = ImGui.InputInt(label, cfg[key])
+    if v then cfg[key] = math.max(min, max and math.min(max, v) or v) end
+end
+
+local function resetCount()
+    S.retrieved, S.charged, S.skipped, S.nothing, S.failed, S.runs = 0, 0, 0, 0, 0, 0
+    S.dropped, S.taken = 0, 0
+    S.step, S.stepsTotal = 0, 0
+    setMsg("Count reset", true)
+end
+
+local function resetDefaults()
+    for _, k in ipairs(SAVE_KEYS) do cfg[k] = DEFAULTS[k] end
+    setMsg("Settings reset to default", true)
+end
+
+local function statusInfo()
+    if S.scanning then return "Scanning", C.cyan end
+    if S.threadAlive and not S.running then return "Stopping", C.yellow end
+    if not S.running then return "Idle", C.white end
+    return S.stage, S.stageCol
+end
+
+---------------- SMALL HELPERS ------------------------
+
+local function captureSpot(kx, ky, label)
+    local mx, my = myTile()
+    if not mx then setMsg("Can't read your position.", false) return end
+    cfg[kx], cfg[ky] = mx, my
+    if kx == "dropX" then S.dropShift = 0 end
+    setMsg(label .. " = " .. mx .. ", " .. my, true)
+end
+
+-- "Drop spot: 46, 25 / not set" + a button that stores the tile you are standing on.
+local function spotRow(label, kx, ky)
+    local set = cfg[kx] ~= 0 or cfg[ky] ~= 0
+    rowv(label, set and (cfg[kx] .. ", " .. cfg[ky]) or "not set", set and C.green or C.yellow)
+    if button(" Capture - stand on it first ##" .. kx) then captureSpot(kx, ky, label) end
+end
+
+---------------- TAB: MAIN ----------------------------
+local function tabMain()
+    local label, col = statusInfo()
+    textColored(col, label)
+    ui("SameLine")
+    local w = curWorld()
+    textColored(C.gray, "   " .. (w ~= "" and w or "unknown"))
+    if S.stepsTotal > 0 then
+        progressBar(math.min(1, S.step / S.stepsTotal))
+        textColored(C.gray, S.step .. " / " .. S.stepsTotal .. "   " .. MODES[cfg.mode] .. "   run #" .. S.runs)
+    end
+
+    ui("Spacing")
+    rowv("Alive / Dead", tostring(getItemCount(cfg.aliveId) or "?") .. " / " .. tostring(getItemCount(cfg.deadId) or "?"), C.white)
+    rowv("Retrieved / Charged", comma(S.retrieved) .. " / " .. comma(S.charged), C.green)
+    rowv("Dropped / Taken", comma(S.dropped) .. " / " .. comma(S.taken), C.white)
+    if S.failed > 0 then rowv("Failed", comma(S.failed), C.red) end
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Mode")
+    for i, name in ipairs(MODES) do
+        if i > 1 then ui("SameLine") end              -- all modes on one line
+        local a, b = ImGui.RadioButton(name .. "##mode", cfg.mode == i)
+        local picked = (b ~= nil) and (b == true) or (a == true)
+        if picked then cfg.mode = i end
+    end
+
+    ui("Spacing")
+    ImGui.Separator()
+    if button(" Drop alive geigers when full: " .. (cfg.dropOn and "ON" or "OFF") .. " ") then cfg.dropOn = not cfg.dropOn end
+    if cfg.dropOn then
+        intInput("Full at", "fullAt", 1, 250)
+        spotRow("Drop spot", "dropX", "dropY")
+    end
+
+    ui("Spacing")
+    ImGui.Separator()
+    if button(" Take dead geigers when out: " .. (cfg.takeOn and "ON" or "OFF") .. " ") then cfg.takeOn = not cfg.takeOn end
+    if cfg.takeOn then
+        spotRow("Take spot", "takeX", "takeY")
+        textColored(C.gray, "Walks there at normal pace, picks them up, walks back.")
+    end
+end
+
+---------------- TAB: OPTIONS -------------------------
+local function tabOptions()
+    local _, w = ImGui.InputText("World", cfg.world, 32)
+    if w then cfg.world = w end
+    textColored(C.gray, "Blank = current world, no warping.")
+
+    ui("Spacing")
+    if cfg.mode == 3 then
+        if button(" Order: " .. (cfg.perCharger and "retrieve + charge at every stop" or "retrieve ALL, then charge ALL") .. " ") then
+            cfg.perCharger = not cfg.perCharger
+        end
+    end
+    if button(" Stand on top of chargers: " .. (cfg.standOnTop and "ON" or "OFF") .. " ") then cfg.standOnTop = not cfg.standOnTop end
+
+    ui("Spacing")
+    ImGui.Separator()
+    local ordName = (cfg.walkOrder == 1 and "NEAREST NEXT") or (cfg.walkOrder == 3 and "RIGHT SIDE FIRST") or "LEFT SIDE FIRST"
+    if button(" Walk order: " .. ordName .. " ") then
+        cfg.walkOrder = (cfg.walkOrder % 3) + 1
+    end
+    if cfg.walkOrder ~= 1 then
+        if button(" Inside a side: " .. (cfg.vertDown ~= false and "TOP -> BOTTOM" or "BOTTOM -> TOP") .. " ") then
+            cfg.vertDown = not (cfg.vertDown ~= false)
+        end
+    end
+    textColored(C.gray, "SIDE FIRST = finish one whole side, then the other (no zig-zag). NEAREST = shortest walk.")
+end
+
+---------------- TAB: TOOLS ---------------------------
+local function tabTools()
+    if button(" Scan area ") then startScan() end
+    ui("SameLine")
+    if button(" Dump to file ") then dumpChargers() end
+    if button(" Reset count ") then
+        if S.running then setMsg("Stop first, then reset.", false) else resetCount() end
+    end
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Config  " .. (S.cfgPath or "autocharger_config.txt"))
+    if button(" Save ", 70, 0) then saveConfig() end
+    ui("SameLine")
+    if button(" Load ", 70, 0) then loadConfig() end
+    ui("SameLine")
+    if button(" Default ", 80, 0) then resetDefaults() end
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Wallpaper id: " .. (cfg.wallpaperId > 0 and cfg.wallpaperId or "not set"))
+    textColored(C.gray, "Chargers = blocks with this wallpaper behind them.")
+    intInput("Wallpaper id", "wallpaperId", 0)
+    if S.learnPunch then
+        if button(" Waiting... click to cancel ") then S.learnPunch = false end
+        textColored(C.cyan, "Now punch a Geiger Charger (with wallpaper) by hand.")
+    else
+        if button(" Learn wallpaper (punch a charger) ") then S.learnPunch = true end
+    end
+    intInput("Dead geiger id", "deadId", 1)
+    intInput("Alive geiger id", "aliveId", 1)
+
+    ui("Spacing")
+    ImGui.Separator()
+    if button(" Debug: " .. (cfg.debug and "ON" or "OFF") .. " ") then cfg.debug = not cfg.debug end
+end
+
+---------------- DRAW ---------------------------------
+local function drawBody()
+    if S.threadAlive and not S.running then
+        textColored(C.yellow, "Stopping... please wait a second.")
+    elseif not S.running then
+        if bigButton(">  START CHARGER") then startRun() end
+    else
+        if bigButton("[]  STOP CHARGER",
+            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            stopRun("stopped by user.")
+        end
+    end
+
+    if S.uiMsg and os.time() < S.uiUntil then
+        textColored(S.uiOk and C.green or C.red, S.uiMsg)
+    end
+
+    ui("Spacing")
+    for i, name in ipairs(TABS) do
+        if i > 1 then ui("SameLine") end
+        if tab == i then
+            colorButton(" " .. name .. " ", 0, 0,
+                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
+        else
+            if button(" " .. name .. " ", 0, 0) then tab = i end
+        end
+    end
+    ImGui.Separator()
+    ui("Spacing")
+
+    if     tab == 1 then tabMain()
+    elseif tab == 2 then tabOptions()
+    else                 tabTools() end
+end
+
+local drawErrors = 0
+AddHook("ondraw", "ach_menu", function(dt)
+    local nc, nv = pushTheme()
+    ui("SetNextWindowSize", 400, 0, 4)
+    ImGui.Begin("Auto Geiger Charger")
+    local widthPushed = ui("PushItemWidth", 240)
+
+    if drawErrors < 3 then
+        local ok, err = pcall(drawBody)
+        if not ok then
+            drawErrors = drawErrors + 1
+            say("`4[Auto Charger] `wMenu error: " .. tostring(err))
+        end
+    end
+
+    if widthPushed then ui("PopItemWidth") end
+    ImGui.End()
+    popTheme(nc, nv)
+end)
+
+math.randomseed(os.time())
+loadConfig(true)
+say("`2[Auto Charger] `wv2 loaded." .. (S.cfgPath and " Config loaded." or "")
+    .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+end  -- startAutoCharger
+
 ---------------- LOADER MENU ---------------------------
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
     { name = "Auto Geiger",           run = startGeiger },
     { name = "Auto Crystal Combine",  run = startAutoCrystal },
+    { name = "Auto Geiger Charger",   run = startAutoCharger },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

@@ -1802,6 +1802,8 @@ local cfg = {
     lowGeiger   = 5,             -- go AFK-drop when this many alive geigers are left
     stepTiles   = 5,             -- max tiles per hop (lower = slower/safer)
     stepDelay   = 300,           -- ms between hops (higher = slower/safer)
+    collectTries = 15,           -- tries to pick up alive geigers in the save world (0 = keep trying until it works)
+    dynSteps    = true,          -- save-world trips (pick up / drop items / drop dead): hop size adapts between 1 and 5 tiles
     breakMin    = 5,             -- every X minutes do a short "break" move
     webhookUrl     = "",         -- Discord webhook URL (paste it in the WebHook tab)
     webhookEnabled = true,       -- post to it on every item found (needs a URL)
@@ -1815,7 +1817,7 @@ local CONFIG_PATHS = {
     "/sdcard/autogeiger_config.txt",
 }
 local SAVE_KEYS = { "worldGeiger", "worldSave", "alivePosX", "alivePosY", "itemDropX", "itemDropY",
-                    "deadDropX", "deadDropY", "lowGeiger", "stepTiles", "stepDelay", "breakMin",
+                    "deadDropX", "deadDropY", "lowGeiger", "stepTiles", "stepDelay", "collectTries", "dynSteps", "breakMin",
                     "webhookUrl", "webhookEnabled" }
 local SAVE_SET = {}
 for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
@@ -1943,10 +1945,18 @@ local function nap(ms)
     end
 end
 
--- Shrinks a move so its real length (not just per axis) is <= stepTiles.
+-- Dynamic hop size (used on the save-world trips): starts at 5 tiles, shrinks toward 1 whenever the
+-- way is blocked and grows back one tile per good hop. Off = the fixed "Max tiles per hop" setting.
+local dyn = { on = false, n = 5 }
+local function stepLimit()
+    if dyn.on then return math.max(1, math.min(5, dyn.n)) end
+    return math.max(1, cfg.stepTiles)
+end
+
+-- Shrinks a move so its real length (not just per axis) is <= the current hop size.
 local function limitStep(dx, dy)
     local len  = math.sqrt(dx * dx + dy * dy)
-    local step = math.max(1, cfg.stepTiles)
+    local step = stepLimit()
     if len <= step then return dx, dy end
     local f  = step / len
     local mx = math.floor(math.abs(dx) * f) * (dx < 0 and -1 or 1)
@@ -1977,10 +1987,10 @@ local function hop(nx, ny)
     return px() ~= sx or py() ~= sy
 end
 
--- Walks to the target in small hops. If a hop is blocked it retries with
--- 1-tile steps, and gives up after 3 tries. It NEVER jumps straight to the
--- target any more (that long jump is what got you kicked).
-local function FindPath(tx, ty)
+-- The old walker: straight-line hops toward the target, 1-tile steps when blocked, gives up after
+-- 3 tries. It never jumps straight to the target (that long jump is what got you kicked). Only the
+-- fallback now - the map-aware FindPath below goes first.
+local function FindPathSimple(tx, ty)
     local stuck = 0
     while S.running do
         local cx, cy = px(), py()
@@ -2002,6 +2012,298 @@ local function FindPath(tx, ty)
             end
         end
         nap(cfg.stepDelay + math.random(0, 100))
+    end
+end
+
+---------------- WORLD MAP + ROUTE AROUND BLOCKS ------
+-- Reads the world's blocks once per world, plans a route over walkable tiles (BFS) and walks it in
+-- hops of at most stepTiles. When a hop gets stuck the tile in front is marked as blocked for a while
+-- and a NEW route is planned from where you stand - so one block in the way no longer ends the move.
+local WORLD_W, WORLD_H = 100, 60
+local MAP = { fg = nil, world = "", blocked = {} }
+local BLOCK_SECS = 120                            -- how long a tile stays "blocked" after a failed hop
+
+local function tf(t, k)                           -- safe field read
+    local ok, v = pcall(function() return t[k] end)
+    if ok then return v end
+    return nil
+end
+
+local function itemInfo(id)
+    for _, fn in ipairs({ "GetItemInfoByID", "GetItemByIDSafe", "GetItemInfo" }) do
+        local f = _G[fn]
+        if type(f) == "function" then
+            local ok, info = pcall(f, id)
+            if ok and info then return info end
+        end
+    end
+    return nil
+end
+
+local colCache = {}
+local function collisionOf(fg)                    -- number, or false if the executor can't tell
+    local v = colCache[fg]
+    if v == nil then
+        v = false
+        local info = itemInfo(fg)
+        if info then
+            for _, key in ipairs({ "collision_type", "collisionType", "collision" }) do
+                local n = tf(info, key)
+                if type(n) == "number" then v = n break end
+            end
+        end
+        colCache[fg] = v
+    end
+    return v
+end
+
+local function fgPassable(fg)                     -- air, or a block with no collision / a platform
+    if fg == 0 then return true end
+    local c = collisionOf(fg)
+    return c == 0 or c == 2
+end
+
+local function fgSolid(fg)                        -- holds you up when it is under your feet
+    if fg == 0 then return false end
+    return collisionOf(fg) ~= 0
+end
+
+local function idx(x, y) return y * WORLD_W + x end
+local function inb(x, y) return x >= 0 and y >= 0 and x < WORLD_W and y < WORLD_H end
+
+local function scanMap()
+    pcall(function()
+        local w = GetWorld()
+        local ww, hh = tonumber(w.width), tonumber(w.height)
+        if ww and hh and ww >= 10 and hh >= 10 and ww <= 400 and hh <= 400 then
+            WORLD_W, WORLD_H = math.floor(ww), math.floor(hh)
+        end
+    end)
+    local fg = {}
+    for y = 0, WORLD_H - 1 do
+        for x = 0, WORLD_W - 1 do
+            local ok, t = pcall(GetTile, x, y)
+            fg[idx(x, y)] = (ok and t and tonumber(tf(t, "fg"))) or 0
+        end
+    end
+    MAP.fg, MAP.world = fg, curWorld()
+end
+
+local function ensureMap()                        -- (re)read the blocks when the world changed
+    if MAP.fg == nil or MAP.world ~= curWorld() then
+        MAP.blocked = {}
+        scanMap()
+    end
+end
+
+local function isPass(x, y)
+    if not inb(x, y) then return false end
+    local b = MAP.blocked[idx(x, y)]
+    if b and os.time() - b < BLOCK_SECS then return false end
+    return fgPassable(MAP.fg[idx(x, y)] or 0)
+end
+
+local function isGrounded(x, y)
+    if y + 1 >= WORLD_H then return true end
+    return fgSolid(MAP.fg[idx(x, y + 1)] or 0)
+end
+
+local DX, DY = { 1, -1, 0, 0 }, { 0, 0, 1, -1 }
+
+local function bfs(sx, sy)                        -- parent map of every tile reachable from (sx, sy)
+    local par = {}
+    local start = idx(sx, sy)
+    par[start] = -1
+    local q, h, tl = { start }, 1, 1
+    while h <= tl do
+        local cur = q[h]
+        h = h + 1
+        local cx, cy = cur % WORLD_W, cur // WORLD_W
+        for i = 1, 4 do
+            local nx, ny = cx + DX[i], cy + DY[i]
+            if isPass(nx, ny) then
+                local k = idx(nx, ny)
+                if par[k] == nil then
+                    par[k] = cur
+                    tl = tl + 1
+                    q[tl] = k
+                end
+            end
+        end
+    end
+    return par
+end
+
+local function pathTo(par, tx, ty)
+    local k = idx(tx, ty)
+    if par[k] == nil then return nil end
+    local rev = {}
+    while par[k] ~= -1 do
+        rev[#rev + 1] = { x = k % WORLD_W, y = k // WORLD_W }
+        k = par[k]
+    end
+    local path = {}
+    for i = #rev, 1, -1 do path[#path + 1] = rev[i] end
+    return path
+end
+
+local function closestReachable(par, tx, ty)      -- the reachable tile nearest to the target
+    local bx, by, bd
+    for k in pairs(par) do
+        local x, y = k % WORLD_W, k // WORLD_W
+        local d = (tx - x) ^ 2 + (ty - y) ^ 2
+        if bd == nil or d < bd or (d == bd and isGrounded(x, y) and not isGrounded(bx, by)) then
+            bx, by, bd = x, y, d
+        end
+    end
+    return bx, by
+end
+
+-- Walks a planned path in hops. Returns true when done, or false plus the path index of the tile
+-- that could not be entered.
+local function walkPath(path)
+    local i = 0
+    while i < #path and S.running do
+        local j = math.min(#path, i + math.max(1, cfg.stepTiles))
+        local k = j
+        while k > i + 1 and not isGrounded(path[k].x, path[k].y) do k = k - 1 end
+        if not isGrounded(path[k].x, path[k].y) then k = j end
+        if not hop(path[k].x, path[k].y) then
+            -- the long hop failed: try just the next tile, so we know exactly which one is stuck
+            if k > i + 1 and hop(path[i + 1].x, path[i + 1].y) then
+                i = i + 1
+            else
+                return false, i + 1
+            end
+        else
+            i = k
+        end
+        nap(cfg.stepDelay + math.random(0, 100))
+    end
+    return true
+end
+
+-- How far (in walkable tiles) every tile is from the target, flooding outward from the target.
+local function flood(tx, ty)
+    local d = {}
+    local start = idx(tx, ty)
+    d[start] = 0
+    local q, h, tl = { start }, 1, 1
+    while h <= tl do
+        local cur = q[h]
+        h = h + 1
+        local cx, cy = cur % WORLD_W, cur // WORLD_W
+        local dc = d[cur]
+        for i = 1, 4 do
+            local nx, ny = cx + DX[i], cy + DY[i]
+            if isPass(nx, ny) then
+                local k = idx(nx, ny)
+                if d[k] == nil then
+                    d[k] = dc + 1
+                    tl = tl + 1
+                    q[tl] = k
+                end
+            end
+        end
+    end
+    return d
+end
+
+-- Smart walk. My map only says which way is "downhill" toward the target; the game's own pathfinder
+-- (short hops of at most stepTiles) decides what is really possible - jumps, gravity, gates. From where
+-- you stand it tries the standable tiles nearby that are closest to the target, best first. A hop that
+-- fails is remembered for this spot and the next best is tried, so a block in the way just means "take
+-- the other side". Tiles already visited get a penalty so it never circles. Returns true on arrival.
+local function smartWalk(tx, ty)
+    local d = flood(tx, ty)
+    local seen, failed = {}, {}
+    for _ = 1, 300 do
+        if not S.running then return false end
+        local R = math.max(1, stepLimit())
+        local cx, cy = px(), py()
+        if cx == tx and cy == ty then return true end
+        local pos = idx(cx, cy)
+        seen[pos] = (seen[pos] or 0) + 1
+        if seen[pos] > 4 then return false end            -- going in circles
+
+        local here = d[pos]
+        if here == nil then                               -- my own tile isn't "walkable" on the map: ask the neighbours
+            for i = 1, 4 do
+                local v = d[idx(cx + DX[i], cy + DY[i])]
+                if v and (here == nil or v + 1 < here) then here = v + 1 end
+            end
+        end
+        if here == nil then return false end              -- the map has no way from here to the target
+
+        local cands = {}
+        for y = cy - R, cy + R do
+            for x = cx - R, cx + R do
+                if (x ~= cx or y ~= cy) and inb(x, y) then
+                    local k = idx(x, y)
+                    local dk = d[k]
+                    if dk and (isGrounded(x, y) or (x == tx and y == ty))
+                       and not (failed[pos] and failed[pos][k]) then
+                        local e = math.sqrt((x - cx) ^ 2 + (y - cy) ^ 2)
+                        if e <= R + 0.5 then                  -- +0.5 so 1-tile hops can still step diagonally (up a ledge)
+                            cands[#cands + 1] = { x = x, y = y, k = k, e = e, score = dk + 6 * (seen[k] or 0) }
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(cands, function(a, b)
+            if a.score ~= b.score then return a.score < b.score end
+            return a.e < b.e
+        end)
+
+        local moved = false
+        for i = 1, math.min(#cands, 8) do
+            if not S.running then return false end
+            local c = cands[i]
+            if hop(c.x, c.y) then moved = true break end
+            failed[pos] = failed[pos] or {}
+            failed[pos][c.k] = true
+        end
+        if not moved then
+            if dyn.on and dyn.n > 1 then
+                dyn.n = dyn.n - 1                        -- blocked: try again with smaller hops
+                seen[pos] = seen[pos] - 1
+            else
+                return false
+            end
+        else
+            if dyn.on and dyn.n < 5 then dyn.n = dyn.n + 1 end   -- clear: stretch the hops again
+            nap(cfg.stepDelay + math.random(0, 100))
+        end
+    end
+    return false
+end
+
+local function FindPath(tx, ty)
+    local okMap = pcall(ensureMap)
+    if not okMap or MAP.fg == nil then return FindPathSimple(tx, ty) end
+    tx = math.max(0, math.min(WORLD_W - 1, tx))
+    ty = math.max(0, math.min(WORLD_H - 1, ty))
+    if px() == tx and py() == ty then return end
+
+    if smartWalk(tx, ty) then return end
+    if not S.running then return end
+
+    -- blocks may have been placed / broken since the scan: read the world again and try once more
+    pcall(scanMap)
+    MAP.blocked = {}
+    if smartWalk(tx, ty) then return end
+    if not S.running then return end
+    if px() == tx and py() == ty then return end
+
+    -- last resorts, neither looks like a jump: one short run of the game's own pathfinder when close, then the old stepper
+    if math.abs(tx - px()) + math.abs(ty - py()) <= 12 then
+        hop(tx, ty)
+        if px() == tx and py() == ty then return end
+    end
+    FindPathSimple(tx, ty)
+    if px() ~= tx or py() ~= ty then
+        say("`4[Auto Geiger] `wCouldn't get to " .. tx .. "," .. ty .. " (stopped at " .. px() .. "," .. py() .. ").")
     end
 end
 
@@ -2050,6 +2352,7 @@ local function loadConfig(silent)
                 end
                 cfg.stepTiles = math.max(1, cfg.stepTiles)
                 cfg.stepDelay = math.max(0, cfg.stepDelay)
+                cfg.collectTries = math.max(0, cfg.collectTries)
                 cfg.breakMin  = math.max(1, cfg.breakMin)
                 cfg.lowGeiger = math.max(0, cfg.lowGeiger)
                 S.cfgPath = p
@@ -2265,7 +2568,52 @@ local function foundGreen()
     end
 end
 
-local function fullAFK()
+-- The alive geigers lie at the geiger spot and are picked up by standing there. Check that the count
+-- really went up; if not, walk beside the spot and back and wait again, until it works. cfg.collectTries
+-- caps the rounds (0 = keep trying until it works or you press Stop) so an empty spot can't hang it.
+local function collectAlive(before)
+    if before == nil then nap(3000) return true end      -- can't read the inventory: just wait like before
+    local offsets = { 0, -1, 1, -2, 2 }
+    local round = 0
+    while S.running do
+        round = round + 1
+        setStage("Collecting alive geigers" .. (round > 1 and (" (try " .. round .. ")") or ""), C.cyan)
+        if round > 1 then                                -- nudge: step beside the spot and back
+            local off = offsets[((round - 1) % #offsets) + 1]
+            FindPath(math.max(0, cfg.alivePosX + off), cfg.alivePosY)
+            nap(400)
+            FindPath(cfg.alivePosX, cfg.alivePosY)
+        end
+        local ax, ay = px(), py()
+        if math.abs(ax - cfg.alivePosX) + math.abs(ay - cfg.alivePosY) > 3 then
+            say("`4[Auto Geiger] `wNot at the geiger spot (" .. cfg.alivePosX .. "," .. cfg.alivePosY
+                .. "), standing at " .. ax .. "," .. ay .. " - check the spot in Settings.")
+        end
+        -- wait for the pickup; once the count starts rising give it a moment more for the rest
+        local waited, best = 0, before
+        while S.running and waited < 3000 do
+            nap(250)
+            waited = waited + 250
+            local now = getItemCount(2204)
+            if now and now > best then best, waited = now, 1500 end
+        end
+        if best > before then
+            say("`2[Auto Geiger] `wCollected " .. (best - before) .. " alive geigers.")
+            return true
+        end
+        if cfg.collectTries > 0 and round >= cfg.collectTries then
+            say("`4[Auto Geiger] `wNo alive geigers picked up after " .. round .. " tries.")
+            return false
+        end
+        if round == 1 or round % 5 == 0 then
+            say("`4[Auto Geiger] `wAlive geigers not collected yet, trying again...")
+        end
+    end
+    return false
+end
+
+local function fullAFKBody()
+    local aliveBefore = getItemCount(2204)                -- to see whether the pickup worked
     setStage("Warping to " .. cfg.worldSave, C.yellow)
     warp(cfg.worldSave)
     nap(5000)
@@ -2276,7 +2624,8 @@ local function fullAFK()
     if not S.running then return end
     FindPath(cfg.alivePosX, cfg.alivePosY)
 
-    nap(3000)
+    collectAlive(aliveBefore)
+    if not S.running then return end
     setStage("Dropping items", C.cyan)
     canDrop = true
     local passes = 0
@@ -2341,6 +2690,14 @@ local function fullAFK()
         nap(5000)
         warp(cfg.worldGeiger)
     end
+end
+
+-- The save-world trip (collect alive geigers, drop items, drop dead geigers) walks with the dynamic hop size.
+local function fullAFK()
+    dyn.on, dyn.n = cfg.dynSteps, 5
+    local ok, err = pcall(fullAFKBody)
+    dyn.on = false
+    if not ok then error(err, 0) end
 end
 
 local stopRun                                 -- defined below (START / STOP)
@@ -2445,6 +2802,7 @@ local function startRun()
     currentRing, newRing, itemFound, breakLoop = red, false, false, false
     S.ring = "Red"
     S.noRestock = false
+    MAP.fg, MAP.blocked = nil, {}                -- re-read the world's blocks on the first move
     S.running   = true
     S.threadAlive = true
     S.startedAt = os.time()
@@ -2734,6 +3092,13 @@ local function tabAdvanced()
     textColored(C.gray, "Lower = slower / safer.")
     intInput("Hop delay (ms)", "stepDelay", 0)
     textColored(C.gray, "Higher = slower / safer.")
+    ui("Spacing")
+    if button(" Dynamic hops 1-5 on save-world trips: " .. (cfg.dynSteps and "ON" or "OFF") .. " ") then
+        cfg.dynSteps = not cfg.dynSteps
+    end
+    textColored(C.gray, "Pick up / drop trips start with 5-tile hops and shrink to 1 where it is blocked.")
+    intInput("Pick-up tries (0 = until done)", "collectTries", 0)
+    textColored(C.gray, "Alive geigers not picked up at the geiger spot: how many times to retry.")
     ui("Spacing")
     intInput("Break every (min)", "breakMin", 1)
     textColored(C.gray, "Every X minutes the bot steps 15 tiles away for a moment.")

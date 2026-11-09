@@ -255,6 +255,20 @@ end
 
 
 
+---------------- RETURN TO LOADER ----------------------
+-- ACTIVE.stop is set by the launched script (stops its loops/threads).
+-- The Return button only raises a flag; the loader's own draw hook does the
+-- clean-up (stop script, disable + remove its hooks, show the loader again).
+local ACTIVE = { stop = nil, returnReq = false }
+
+local function returnButton()                  -- small button, top-left of the window
+    if colorButton(" < Return ", 0, 0,
+        { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 }) then
+        ACTIVE.returnReq = true
+    end
+    ui("Spacing")
+end
+
 local function startAutoSB()
 --====================================================
 --  AUTO SUPER BROADCAST v4  (/sb <text> <tag>) + ImGui menu
@@ -1119,6 +1133,7 @@ AddHook("ondraw", "autosb_menu", function(dt)
     ui("SetNextWindowSize", 440, 0, 4)        -- first-use size, you can still resize
     ImGui.Begin("Auto SB - PoliceMan v4")
     local widthPushed = ui("PushItemWidth", 240)
+    returnButton()
 
     ------------- START / STOP (full width) -------------
     if not S.running then
@@ -1174,6 +1189,8 @@ math.randomseed(os.time())
 pickEmoji()
 loadConfig(true)                              -- load saved settings on startup
 say("`2[Auto SB] v4 loaded." .. (S.cfgPath and " Config loaded." or ""))
+
+ACTIVE.stop = function() stop("returned to loader.") end
 
 end  -- startAutoSB
 
@@ -1686,6 +1703,7 @@ local function drawMenu()
     ui("SetNextWindowSize", 360, 0, 4)
     ImGui.Begin("Vend Helper")
     local widthPushed = ui("PushItemWidth", 200)
+    returnButton()
 
     section("AUTO ADD / BUY")
     if button(" Auto Add (own vend): " .. (S.add and "ON" or "OFF") .. " ") then
@@ -3180,6 +3198,7 @@ AddHook("ondraw", "gwk_menu", function(dt)
     ui("SetNextWindowSize", 440, 0, 4)        -- first-use size, you can still resize
     ImGui.Begin("Auto Geiger")
     local widthPushed = ui("PushItemWidth", 240)
+    returnButton()
 
     if drawErrors < 3 then
         local ok, err = pcall(drawBody)
@@ -3197,6 +3216,8 @@ end)
 math.randomseed(os.time())
 loadConfig(true)                              -- load saved settings on startup
 say("`2[Auto Geiger] loaded." .. (S.cfgPath and " Config loaded." or ""))
+
+ACTIVE.stop = function() stopRun("returned to loader.") end
 
 end  -- startGeiger
 
@@ -3804,6 +3825,7 @@ AddHook("ondraw", "ac_menu", function(dt)
     ui("SetNextWindowSize", 440, 0, 4)
     ImGui.Begin("Auto Crystal Combine")
     local widthPushed = ui("PushItemWidth", 220)
+    returnButton()
 
     if drawErrors < 3 then
         local ok, err = pcall(drawBody)
@@ -3822,6 +3844,8 @@ math.randomseed(os.time())
 loadConfig(true)
 say("`2[Auto Crystal] `wloaded." .. (S.cfgPath and " Config loaded." or "")
     .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+ACTIVE.stop = function() stopRun("returned to loader.") end
 
 end  -- startAutoCrystal
 
@@ -5465,6 +5489,7 @@ AddHook("ondraw", "ach_menu", function(dt)
     ui("SetNextWindowSize", 400, 0, 4)
     ImGui.Begin("Auto Geiger Charger")
     local widthPushed = ui("PushItemWidth", 240)
+    returnButton()
 
     if drawErrors < 3 then
         local ok, err = pcall(drawBody)
@@ -5483,6 +5508,8 @@ math.randomseed(os.time())
 loadConfig(true)
 say("`2[Auto Charger] `wv2 loaded." .. (S.cfgPath and " Config loaded." or "")
     .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+ACTIVE.stop = function() stopRun("returned to loader.") end
 
 end  -- startAutoCharger
 
@@ -5824,6 +5851,7 @@ AddHook("ondraw", "taxuws_menu", function(dt)
     ui("SetNextWindowSize", 400, 0, 4)
     ImGui.Begin("Tax to UWS")
     local widthPushed = ui("PushItemWidth", 220)
+    returnButton()
 
     if drawErrors < 3 then
         local ok, err = pcall(drawBody)
@@ -5841,6 +5869,8 @@ end)
 loadConfig(true)
 say("`2[Tax to UWS] `wloaded." .. (S.cfgPath and " Config loaded." or "")
     .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+ACTIVE.stop = function() stopRun("returned to loader.") end
 
 end  -- startTaxToUWS
 
@@ -6319,6 +6349,7 @@ AddHook("ondraw", "autodrop_menu", function(dt)
     ui("SetNextWindowSize", 440, 0, 4)
     ImGui.Begin("Auto Drop / Trash")
     local widthPushed = ui("PushItemWidth", 200)
+    returnButton()
 
     if drawErrors < 3 then
         local ok, err = pcall(drawBody)
@@ -6335,6 +6366,8 @@ end)
 
 loadConfig(true)
 say("`2[Auto Drop] `wloaded." .. (S.cfgPath and " Config loaded." or ""))
+
+ACTIVE.stop = function() stopRun("returned to loader.") end
 
 end  -- startAutoDrop
 
@@ -6605,7 +6638,344 @@ local LOADER_OPTIONS = {
     { name = "Tax to UWS",            run = startTaxToUWS },
     { name = "Auto Drop / Trash",     run = startAutoDrop },
 }
-local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
+local loader = { selected = 1, launched = false, launchedName = nil, err = nil, gate = nil }
+
+---------------- HIDE / SHOW HOTKEY ----------------------
+-- Hides / shows ALL menus (loader + launched script). Scripts keep running
+-- while hidden: their draw hooks still run, but ImGui is swapped for a
+-- do-nothing stand-in, so nothing is drawn.
+--   * Chat command  /loader  ALWAYS works (no key reading needed).
+--   * Hotkey (default TAB) works when the executor can read keys; the
+--     first working method is picked automatically (see BACKENDS).
+-- The key can be changed from the loader menu only (benloader_config.txt).
+local UI = { hidden = false }
+local realImGui = ImGui
+local noop = function() return false end
+local NULL_IMGUI = setmetatable({}, { __index = function(_, k)
+    local v = realImGui[k]
+    if type(v) == "function" then return noop end
+    return v                                    -- tables like Col / StyleVar stay real
+end })
+
+local HK = { name = "Tab", spec = nil, capturing = false, last = 0, wasDown = false,
+             base = nil, bk = nil, retry = 0 }
+local HK_PATHS = { "benloader_config.txt", "scripts/benloader_config.txt", "/sdcard/benloader_config.txt" }
+
+-- Windows virtual-key codes <-> names
+local VKS, VKNAME = {}, {}
+local function defVK(name, code) VKS[name] = code VKNAME[code] = name end
+defVK("Backspace", 8) defVK("Tab", 9) defVK("Enter", 13) defVK("Escape", 27) defVK("Space", 32)
+defVK("PageUp", 33) defVK("PageDown", 34) defVK("End", 35) defVK("Home", 36)
+defVK("Left", 37) defVK("Up", 38) defVK("Right", 39) defVK("Down", 40)
+defVK("Insert", 45) defVK("Delete", 46) defVK("Grave", 192) defVK("Backslash", 220)
+for i = 0, 9 do defVK(tostring(i), 48 + i) end
+for i = 0, 25 do defVK(string.char(65 + i), 65 + i) end
+for i = 1, 12 do defVK("F" .. i, 111 + i) end
+
+local function keyTable()                         -- ImGui's own key enum, if the binding has one
+    for _, get in ipairs({ function() return ImGui.Key end, function() return _G.ImGuiKey end }) do
+        local ok, t = pcall(get)
+        if ok and (type(t) == "table" or type(t) == "userdata") then return t end
+    end
+    return nil
+end
+
+local function imCode(name)                       -- ImGui key code for a key name (nil = unknown)
+    local kt = keyTable()
+    if kt then
+        for _, k in ipairs({ name, "ImGuiKey_" .. name }) do
+            local ok, v = pcall(function() return kt[k] end)
+            if ok and v ~= nil then return v end
+        end
+        return nil
+    end
+    if name == "Tab" then return 512 end          -- ImGuiKey_Tab in current ImGui
+    local n = name:match("^Key#(%d+)$")
+    return n and tonumber(n) or nil
+end
+
+local function specFor(name)
+    return { name = name, vk = VKS[name] or tonumber(name:match("^Key#(%d+)$") or ""), im = imCode(name) }
+end
+
+local function winState(fname, k)                 -- GetAsyncKeyState-style: high bit = down
+    local f = _G[fname]
+    if type(f) ~= "function" or k.vk == nil then return nil end
+    local ok, r = pcall(f, k.vk)
+    if not ok then return nil end
+    if type(r) == "boolean" then return r end
+    if type(r) == "number" then
+        if r < 0 then return true end
+        local i = math.tointeger(r)
+        return i ~= nil and (i & 0x8000) ~= 0
+    end
+    return false
+end
+
+local function globalKey(fname, k)                -- IsKeyDown(vk) / IsKeyPressed(vk) style
+    local f = _G[fname]
+    if type(f) ~= "function" or k.vk == nil then return nil end
+    local ok, r = pcall(f, k.vk)
+    if not ok then return nil end
+    return r == true or (type(r) == "number" and r ~= 0)
+end
+
+-- Each backend answers true/false, or nil when it can't be used.
+-- "pressed" = true only on the frame the key goes down; "down" = held (edge is detected here).
+local BACKENDS = {
+    { name = "ImGui.IsKeyPressed", im = true, pressed = function(k)
+        local f = ImGui.IsKeyPressed
+        if type(f) ~= "function" or k.im == nil then return nil end
+        local ok, r = pcall(f, k.im, false)
+        if not ok then ok, r = pcall(f, k.im) end
+        if ok then return r == true end
+        return nil
+    end },
+    { name = "ImGui.IsKeyDown", im = true, down = function(k)
+        local f = ImGui.IsKeyDown
+        if type(f) ~= "function" or k.im == nil then return nil end
+        local ok, r = pcall(f, k.im)
+        if ok then return r == true end
+        return nil
+    end },
+    { name = "GetAsyncKeyState", down = function(k) return winState("GetAsyncKeyState", k) end },
+    { name = "GetKeyState",      down = function(k) return winState("GetKeyState", k) end },
+    { name = "IsKeyDown",        down = function(k) return globalKey("IsKeyDown", k) end },
+    { name = "IsKeyPressed",     pressed = function(k) return globalKey("IsKeyPressed", k) end },
+}
+
+local function pickBackend()
+    if HK.bk then return HK.bk end
+    local tab = specFor("Tab")
+    for _, b in ipairs(BACKENDS) do
+        local f = b.pressed or b.down
+        if f(tab) ~= nil then HK.bk = b return b end
+    end
+    return nil
+end
+
+local SKIP_KEY = { "Mouse", "Gamepad", "Mod", "Reserved", "Count", "COUNT", "None", "Nav", "Keys" }
+local function candidates()                       -- every key the active backend can test
+    local list = {}
+    if HK.bk.im then
+        local kt = keyTable()
+        if kt then
+            pcall(function()
+                for k, v in pairs(kt) do
+                    if type(k) == "string" then
+                        local nm, skip = (k:gsub("^ImGuiKey_", "")), false
+                        for _, s in ipairs(SKIP_KEY) do
+                            if nm:find(s, 1, true) then skip = true break end
+                        end
+                        if not skip then list[#list + 1] = { name = nm, im = v, vk = VKS[nm] } end
+                    end
+                end
+            end)
+        else
+            for c = 512, 652 do list[#list + 1] = { name = "Key#" .. c, im = c } end
+        end
+    else
+        for vk = 8, 254 do list[#list + 1] = { name = VKNAME[vk] or ("Key#" .. vk), vk = vk } end
+    end
+    return list
+end
+
+local function captureTick()                      -- returns the key spec being pressed, if any
+    local b, list = HK.bk, candidates()
+    if b.pressed then
+        for _, k in ipairs(list) do if b.pressed(k) == true then return k end end
+        return nil
+    end
+    if not HK.base then                           -- ignore keys that are already held when capture starts
+        HK.base = {}
+        for _, k in ipairs(list) do if b.down(k) == true then HK.base[k.name] = true end end
+        return nil
+    end
+    for _, k in ipairs(list) do
+        local d = b.down(k) == true
+        if d and not HK.base[k.name] then return k end
+        if not d then HK.base[k.name] = nil end
+    end
+    return nil
+end
+
+local function saveHotkey()
+    for _, pth in ipairs(HK_PATHS) do
+        local ok, f = pcall(io.open, pth, "w")
+        if ok and f and pcall(function() f:write("hotkey=" .. HK.name .. "\n") f:close() end) then return true end
+    end
+    return false
+end
+
+local function setHotkey(name)
+    local s = specFor(name)
+    if s.vk == nil and s.im == nil then name, s = "Tab", specFor("Tab") end
+    HK.name, HK.spec = name, s
+end
+
+local function loadHotkey()
+    for _, pth in ipairs(HK_PATHS) do
+        local ok, f = pcall(io.open, pth, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            local nm = rok and data and data:match("hotkey=([%w#_]+)")
+            if nm then setHotkey(nm) end
+            return
+        end
+    end
+end
+
+local function toggleHidden()
+    UI.hidden = not UI.hidden
+    LogToConsole("`2[Ben Loader] `wMenus " .. (UI.hidden and "hidden" or "shown")
+        .. " - type `9/loader `wor press `9" .. HK.name:upper() .. " `wto " .. (UI.hidden and "show" or "hide") .. " them")
+end
+
+local function hotkeyTick()
+    if not HK.bk then
+        if os.clock() - HK.retry < 3 then return end   -- keep retrying quietly
+        HK.retry = os.clock()
+        if not pickBackend() then return end
+    end
+    if HK.capturing then
+        local k = captureTick()
+        if k then
+            HK.capturing, HK.base = false, nil
+            if k.name ~= "Escape" then
+                HK.name, HK.spec = k.name, k
+                saveHotkey()
+                LogToConsole("`2[Ben Loader] `wHotkey set to `9" .. HK.name:upper())
+            end
+        end
+        return
+    end
+    if os.clock() - HK.last < 0.25 then return end
+    local okA, active = pcall(ImGui.IsAnyItemActive)
+    if okA and active == true then return end          -- typing in a text box: ignore
+    local b = HK.bk
+    local fired
+    if b.pressed then
+        fired = b.pressed(HK.spec) == true
+    else
+        local d = b.down(HK.spec) == true
+        fired = d and not HK.wasDown
+        HK.wasDown = d
+    end
+    if fired then
+        HK.last = os.clock()
+        toggleHidden()
+    end
+end
+
+-- Chat command: always available, no key API needed.
+local cmdLastPkt, cmdLastClock, cmdLastRes = nil, -1, false
+local function cmdHook(ptype, packet)
+    if type(packet) ~= "string" then return false end
+    local c = os.clock()
+    if packet == cmdLastPkt and c - cmdLastClock < 0.01 then return cmdLastRes end   -- same event, 2nd hook
+    local res = false
+    if packet:find("action|input\n|text|/loader", 1, true) then
+        toggleHidden()
+        res = true                                -- don't send the command to the server
+    end
+    cmdLastPkt, cmdLastClock, cmdLastRes = packet, c, res
+    return res
+end
+pcall(AddHook, "OnSendPacket", "benloader_cmd1", cmdHook)
+pcall(AddHook, "onsendpacket", "benloader_cmd2", cmdHook)
+
+local function dumpKeySupport()                   -- prints what this executor offers, to the console
+    local function names(t, label)
+        local out = {}
+        pcall(function()
+            for k in pairs(t) do
+                if type(k) == "string" and k:lower():find("key", 1, true) then out[#out + 1] = k end
+            end
+        end)
+        table.sort(out)
+        LogToConsole("`2[Ben Loader] `w" .. label .. ": `9" .. (#out > 0 and table.concat(out, ", ") or "(none found)"))
+    end
+    names(realImGui, "ImGui key names")
+    names(_G, "Global key names")
+    LogToConsole("`2[Ben Loader] `wKey reading in use: `9" .. (HK.bk and HK.bk.name or "none"))
+end
+
+local function drawHotkeySection()             -- one compact row
+    if HK.capturing then
+        textColored(C.cyan, "Press a key... (Esc = cancel)")
+        ui("SameLine")
+        if button(" Cancel ") then HK.capturing, HK.base = false, nil end
+        ui("Spacing")
+        return
+    end
+    textColored(C.white, "Hotkey")
+    ui("SameLine")
+    textColored(C.gold, HK.bk and HK.name:upper() or "/loader")
+    if HK.bk then
+        ui("SameLine")
+        if button(" Change ") then HK.capturing, HK.base = true, nil end
+        ui("SameLine")
+        if button(" Reset ") then setHotkey("Tab") saveHotkey() end
+    end
+    ui("SameLine")
+    if button(" ? ") then dumpKeySupport() end      -- prints key support to the console
+    ui("Spacing")
+end
+
+loadHotkey()
+if HK.spec == nil then setHotkey("Tab") end
+
+-- While a script is being launched, AddHook is swapped for a tracking wrapper:
+-- every hook it registers gets a unique name, is remembered, and is gated by
+-- gate.alive - so on Return the hooks are removed (RemoveHook) and, even if
+-- this executor has no RemoveHook, they are turned into harmless no-ops.
+local realAddHook = AddHook
+local launchCount = 0
+
+local function killGate()
+    local g = loader.gate
+    if not g then return end
+    g.alive = false
+    if type(RemoveHook) == "function" then
+        for _, h in ipairs(g.hooks) do
+            pcall(RemoveHook, h[2])
+            pcall(RemoveHook, h[1], h[2])
+        end
+    end
+    loader.gate = nil
+end
+
+local function launchScript(opt)
+    launchCount = launchCount + 1
+    local gate = { alive = true, hooks = {} }
+    loader.gate = gate
+    ACTIVE.stop, ACTIVE.returnReq = nil, false
+    local suffix = "_L" .. launchCount
+    local function wrapped(ev, name, fn, ...)
+        local uname = tostring(name) .. suffix
+        gate.hooks[#gate.hooks + 1] = { ev, uname }
+        local isDraw = tostring(ev):lower() == "ondraw"
+        return realAddHook(ev, uname, function(...)
+            if not gate.alive then return false end
+            if UI.hidden and isDraw then
+                -- hidden: still run the hook (timers / ticks), but draw nothing
+                if pcall(function() ImGui = NULL_IMGUI end) then
+                    pcall(fn, ...)
+                    pcall(function() ImGui = realImGui end)
+                    return false
+                end
+            end
+            return fn(...)
+        end, ...)
+    end
+    if not pcall(function() AddHook = wrapped end) then
+        LogToConsole("`4[Ben Loader] `wCan't track hooks in this executor - Return will stop the script but not remove its hooks.")
+    end
+    local ok, err = pcall(opt.run)
+    pcall(function() AddHook = realAddHook end)
+    if not ok then killGate() end
+    return ok, err
+end
 
 -- RadioButton's return convention isn't certain (varies by ImGui binding),
 -- so accept either a single "clicked" bool or a (something, clicked) pair,
@@ -6616,17 +6986,26 @@ local function radioPicked(a, b)
 end
 
 AddHook("ondraw", "script_loader_menu", function(dt)
+    pcall(hotkeyTick)
     if loader.launched then
-        -- Once a script is launched, the loader window is gone for good -
-        -- only the launched script's own window(s) show from here on.
-        return
+        -- A script is running: only its own window shows, until it asks to Return.
+        if not ACTIVE.returnReq then return end
+        ACTIVE.returnReq = false
+        pcall(function() if ACTIVE.stop then ACTIVE.stop() end end)
+        killGate()
+        ACTIVE.stop = nil
+        loader.launched, loader.launchedName, loader.err = false, nil, nil
+        LogToConsole("`2[Ben Loader] `wReturned to the loader - script stopped, hooks removed.")
     end
+
+    if UI.hidden then return end
 
     local nc, nv = pushTheme()
     ui("SetNextWindowSize", 360, 0, 4)
     ImGui.Begin("Ben Loader")
 
     section("SELECT A SCRIPT")
+    drawHotkeySection()
     textColored(C.gold, "SELECTED: " .. LOADER_OPTIONS[loader.selected].name)
     ui("Spacing")
     for i, opt in ipairs(LOADER_OPTIONS) do
@@ -6638,7 +7017,7 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     ImGui.Separator()
     if bigButton(">  LAUNCH SELECTED SCRIPT") then
         local opt = LOADER_OPTIONS[loader.selected]
-        local ok, err = pcall(opt.run)
+        local ok, err = launchScript(opt)
         if ok then
             loader.launched, loader.launchedName = true, opt.name
         else

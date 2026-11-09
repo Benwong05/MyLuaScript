@@ -5844,6 +5844,500 @@ say("`2[Tax to UWS] `wloaded." .. (S.cfgPath and " Config loaded." or "")
 
 end  -- startTaxToUWS
 
+--====================================================
+--  AUTO DROP / TRASH  (module for Ben Loader)
+--  Pick items from your backpack and set, for each one, the amount at which
+--  it should be dropped or trashed (1-250). The script keeps rotating through
+--  your list: whenever you hold at least that many of an item, it drops (or
+--  trashes / recycles) everything you have of it, then moves on to the next.
+--  Uses the loader's shared helpers (C, ui, textColored, section, button,
+--  bigButton, colorButton, rowv, pushTheme, popTheme).
+--====================================================
+local function startAutoDrop()
+
+---------------- SETTINGS (defaults) -----------------
+local cfg = {
+    mode    = 1,        -- 1 = drop, 2 = trash / recycle
+    delay   = 300,      -- ms pause after each drop / trash
+    scanMs  = 200,      -- ms between checks of the whole list
+    newAt   = 250,      -- amount a newly added item starts with
+}
+local rules = {}        -- { id = item id, at = amount that triggers it }
+
+local CONFIG_PATHS = { "autodrop_config.txt", "scripts/autodrop_config.txt", "/sdcard/autodrop_config.txt" }
+local SAVE_KEYS = { "mode", "delay", "scanMs", "newAt" }
+local SAVE_SET = {}
+for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
+
+local MODE_NAME = { "DROP", "TRASH" }
+local PROTECTED = { [18] = true, [32] = true }   -- fist and wrench can never be dropped
+
+---------------- STATE -------------------------------
+local S = {
+    running = false, threadAlive = false,
+    stage = "Idle", stageCol = C.white,
+    actions = 0, items = 0, fails = 0,
+    last = "-", cantDrop = false,
+    perItem = {},                 -- id -> total handled this session
+    skipUntil = {},               -- id -> os.time() before which a failed item is not retried
+    startedAt = 0, runAccum = 0,
+    cfgPath = nil, uiMsg = nil, uiOk = true, uiUntil = 0,
+}
+
+---------------- HELPERS -----------------------------
+local function say(msg) LogToConsole(msg) end
+local function setMsg(text, ok) S.uiMsg, S.uiOk, S.uiUntil = text, ok, os.time() + 5 end
+local function setStage(text, col) S.stage, S.stageCol = text, col or C.white end
+local function comma(n)
+    local r = tostring(math.floor(n)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (r:gsub("^,", ""))
+end
+local function fmtClock(secs)
+    secs = math.max(0, math.floor(secs))
+    local h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    if h > 0 then return string.format("%dh %02dm %02ds", h, m, s) end
+    return string.format("%dm %02ds", m, s)
+end
+local function clampAt(n) return math.max(1, math.min(250, math.floor(tonumber(n) or 1))) end
+
+local function nap(ms)                            -- sleep that reacts quickly to STOP
+    local left = ms
+    while left > 0 and S.running do
+        local s = math.min(250, left)
+        Sleep(s)
+        left = left - s
+    end
+end
+
+local function getItemCount(id)                   -- nil if the inventory can't be read
+    local ok, n = pcall(function()
+        for _, itm in pairs(GetInventory()) do
+            if itm.id == id then return itm.amount end
+        end
+        return 0
+    end)
+    if ok and type(n) == "number" then return n end
+    return nil
+end
+
+local function tf(t, k)
+    local ok, v = pcall(function() return t[k] end)
+    if ok then return v end
+    return nil
+end
+
+local nameCache = {}
+local function itemName(id)
+    local v = nameCache[id]
+    if v then return v end
+    v = "Item #" .. id
+    for _, fn in ipairs({ "GetItemInfoByID", "GetItemByIDSafe", "GetItemInfo" }) do
+        local f = _G[fn]
+        if type(f) == "function" then
+            local ok, info = pcall(f, id)
+            if ok and info then
+                local n = tf(info, "name")
+                if type(n) == "string" and n ~= "" then v = n break end
+            end
+        end
+    end
+    nameCache[id] = v
+    return v
+end
+
+local function ruleIndex(id)
+    for i, r in ipairs(rules) do if r.id == id then return i end end
+    return nil
+end
+
+local function addRule(id, at)
+    id = math.floor(tonumber(id) or 0)
+    if id <= 0 then setMsg("Enter a valid item id.", false) return end
+    if PROTECTED[id] then setMsg("That item can't be dropped (fist / wrench).", false) return end
+    if ruleIndex(id) then setMsg(itemName(id) .. " is already in the list.", false) return end
+    rules[#rules + 1] = { id = id, at = clampAt(at or cfg.newAt) }
+    setMsg("Added " .. itemName(id), true)
+end
+
+---------------- CONFIG SAVE / LOAD ------------------
+local function saveConfig(silent)
+    local lines = {}
+    for _, k in ipairs(SAVE_KEYS) do lines[#lines + 1] = k .. "=" .. tostring(cfg[k]) end
+    local rs = {}
+    for _, r in ipairs(rules) do rs[#rs + 1] = r.id .. ":" .. r.at end
+    lines[#lines + 1] = "rules=" .. table.concat(rs, ",")
+    local data = table.concat(lines, "\n") .. "\n"
+    local order = {}
+    if S.cfgPath then order[1] = S.cfgPath end
+    for _, p in ipairs(CONFIG_PATHS) do order[#order + 1] = p end
+    for _, p in ipairs(order) do
+        local ok, f = pcall(io.open, p, "w")
+        if ok and f then
+            if pcall(function() f:write(data) f:close() end) then
+                S.cfgPath = p
+                if not silent then setMsg("Config saved (" .. p .. ")", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("Could not save config (no writable path)", false) end
+    return false
+end
+
+local function loadConfig(silent)
+    for _, p in ipairs(CONFIG_PATHS) do
+        local ok, f = pcall(io.open, p, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            if rok and data and data ~= "" then
+                for line in data:gmatch("[^\r\n]+") do
+                    local k, v = line:match("^(%w+)=(.*)$")
+                    if k == "rules" then
+                        rules = {}
+                        for id, at in v:gmatch("(%d+):(%d+)") do
+                            local n = tonumber(id)
+                            if n and not PROTECTED[n] and not ruleIndex(n) then
+                                rules[#rules + 1] = { id = n, at = clampAt(at) }
+                            end
+                        end
+                    elseif k and SAVE_SET[k] and cfg[k] ~= nil then
+                        cfg[k] = tonumber(v) or cfg[k]
+                    end
+                end
+                cfg.mode   = math.max(1, math.min(2, cfg.mode))
+                cfg.delay  = math.max(0, cfg.delay)
+                cfg.scanMs = math.max(50, cfg.scanMs)
+                cfg.newAt  = clampAt(cfg.newAt)
+                S.cfgPath = p
+                if not silent then setMsg("Config loaded", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("No saved config found", false) end
+    return false
+end
+
+---------------- DROP / TRASH -------------------------
+local function packetFor(id, count)
+    if cfg.mode == 2 then
+        return "action|dialog_return\ndialog_name|trash\nitem_trash|" .. id .. "|\nitem_count|" .. count .. "\n"
+    end
+    return "action|dialog_return\ndialog_name|drop\nitem_drop|" .. id .. "|\nitem_count|" .. count .. "\n"
+end
+
+-- Handles one item: true = it went away, false = refused / nothing changed.
+local function handle(r, have)
+    local amt = math.min(have, 250)               -- the game box takes at most 250 at a time
+    S.cantDrop = false
+    SendPacket(2, packetFor(r.id, amt))
+    local waited = 0
+    while S.running and waited < 2000 do
+        nap(100)
+        waited = waited + 100
+        local now = getItemCount(r.id)
+        if now and now < have then
+            local gone = have - now
+            S.actions = S.actions + 1
+            S.items = S.items + gone
+            S.perItem[r.id] = (S.perItem[r.id] or 0) + gone
+            S.last = MODE_NAME[cfg.mode] .. " " .. gone .. " x " .. itemName(r.id)
+            return true
+        end
+        if S.cantDrop then break end
+    end
+    return false
+end
+
+local function mainLoop()
+    while S.running do
+        setStage("Watching " .. #rules .. " item(s)", C.green)
+        for _, r in ipairs(rules) do
+            if not S.running then return end
+            local skip = S.skipUntil[r.id]
+            if not skip or os.time() >= skip then
+                local have = getItemCount(r.id)
+                if have and have > 0 and have >= r.at then
+                    setStage((cfg.mode == 2 and "Trashing " or "Dropping ") .. itemName(r.id), C.yellow)
+                    if handle(r, have) then
+                        S.skipUntil[r.id] = nil
+                        nap(cfg.delay)
+                    elseif S.running then
+                        S.fails = S.fails + 1
+                        S.skipUntil[r.id] = os.time() + 5       -- don't hammer it, try again in 5 s
+                        S.last = "FAILED " .. itemName(r.id) .. (S.cantDrop and " (can't drop here)" or "")
+                        say("`4[Auto Drop] `wCouldn't " .. (cfg.mode == 2 and "trash " or "drop ")
+                            .. itemName(r.id) .. (S.cantDrop and " - no room to drop here, move to open floor." or "."))
+                    end
+                end
+            end
+        end
+        nap(cfg.scanMs)
+    end
+end
+
+local function stopRun(reason)
+    if not S.running then return end
+    S.running = false
+    S.runAccum = S.runAccum + (os.time() - S.startedAt)
+    setStage("Stopping", C.yellow)
+    say("`4[Auto Drop] Stopped: `w" .. (reason or "stopped by user."))
+end
+
+local function startRun()
+    if S.threadAlive then setMsg("Still stopping, try again in a second.", false) return end
+    if #rules == 0 then setMsg("Add at least one item first (Items tab).", false) return end
+    saveConfig(true)
+    S.running, S.threadAlive = true, true
+    S.skipUntil = {}
+    S.startedAt = os.time()
+    setStage("Starting", C.green)
+    say("`2[Auto Drop] `wStarted: " .. MODE_NAME[cfg.mode] .. ", " .. #rules .. " item(s).")
+    RunThread(function()
+        local ok, err = pcall(mainLoop)
+        if not ok then say("`4[Auto Drop] `wError: " .. tostring(err)) end
+        if S.running then
+            S.running = false
+            S.runAccum = S.runAccum + (os.time() - S.startedAt)
+        end
+        S.threadAlive = false
+        setStage("Idle", C.white)
+    end)
+end
+
+---------------- HOOK ----------------
+AddHook("onvariant", "autodrop_var", function(var)
+    local ok, name = pcall(function() return tostring(var[0] or "") end)
+    if not ok or name ~= "OnTextOverlay" then return false end
+    local okt, txt = pcall(function() return tostring(var[1] or "") end)
+    if okt then
+        txt = txt:gsub("`.", ""):lower()
+        if txt:find("can't drop", 1, true) or txt:find("cannot drop", 1, true) or txt:find("no room", 1, true) then
+            S.cantDrop = true
+        end
+    end
+    return false
+end)
+
+---------------- MENU ---------------------------------
+local DEFAULTS = {}
+for _, k in ipairs(SAVE_KEYS) do DEFAULTS[k] = cfg[k] end
+
+local tab  = 1
+local TABS = { "Stats", "Items", "Advanced" }
+
+local function intInput(label, key, min)
+    local _, v = ImGui.InputInt(label, cfg[key])
+    if v then cfg[key] = math.max(min, v) end
+end
+
+local function resetCount()
+    S.actions, S.items, S.fails, S.runAccum = 0, 0, 0, 0
+    S.perItem, S.last = {}, "-"
+    if S.running then S.startedAt = os.time() end
+    setMsg("Count reset", true)
+end
+
+local function resetDefaults()
+    for _, k in ipairs(SAVE_KEYS) do cfg[k] = DEFAULTS[k] end
+    setMsg("Settings reset to default (item list kept)", true)
+end
+
+local function statusInfo()
+    if S.threadAlive and not S.running then return "Stopping", C.yellow end
+    if not S.running then return "Idle", C.white end
+    return S.stage, S.stageCol
+end
+
+-- backpack picker: refreshed about once a second
+local pick = { at = 0, list = {}, filter = "", addId = 0 }
+local function refreshPick()
+    if os.time() - pick.at < 1 then return end
+    pick.at = os.time()
+    local list = {}
+    pcall(function()
+        for _, itm in pairs(GetInventory()) do
+            local id, amt = itm.id, itm.amount
+            if id and amt and amt > 0 and not PROTECTED[id] then
+                list[#list + 1] = { id = id, amount = amt, name = itemName(id) }
+            end
+        end
+    end)
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    pick.list = list
+end
+
+local function tabStats()
+    local label, col = statusInfo()
+    textColored(col, label)
+    ui("SameLine")
+    textColored(C.gray, "   " .. MODE_NAME[cfg.mode] .. "   " .. #rules .. " item(s)")
+
+    ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+
+    local elapsed = S.runAccum + (S.running and (os.time() - S.startedAt) or 0)
+    rowv("Actions", comma(S.actions), C.white)
+    ui("Spacing")
+    rowv("Items " .. (cfg.mode == 2 and "trashed" or "dropped"), comma(S.items), C.green)
+    ui("Spacing")
+    rowv("Failed", comma(S.fails), S.fails > 0 and C.red or C.white)
+    ui("Spacing")
+    rowv("Run time", fmtClock(elapsed), C.white)
+    ui("Spacing")
+    textColored(C.gray, "last: " .. S.last)
+
+    if #rules > 0 then
+        ui("Spacing")
+        ImGui.Separator()
+        textColored(C.white, "Per item")
+        for _, r in ipairs(rules) do
+            local have = getItemCount(r.id)
+            rowv(itemName(r.id), (have or "?") .. " / " .. r.at .. "   done " .. comma(S.perItem[r.id] or 0),
+                (have and have >= r.at) and C.yellow or C.gray)
+        end
+    end
+
+    ui("Spacing")
+    if button("Reset Count", -1, 30) then resetCount() end
+end
+
+local function tabItems()
+    if button(" Action: " .. MODE_NAME[cfg.mode] .. (cfg.mode == 2 and "  (recycle)" or "") .. " ") then
+        cfg.mode = (cfg.mode % 2) + 1
+    end
+    textColored(C.gray, "Click to switch between DROP and TRASH.")
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Selected items  (acts when you hold at least this many)")
+    if #rules == 0 then textColored(C.yellow, "None yet - add some below.") end
+
+    local removeAt = nil
+    for i, r in ipairs(rules) do
+        local have = getItemCount(r.id)
+        textColored(C.white, itemName(r.id))
+        ui("SameLine", 250)
+        textColored(C.gray, "have " .. tostring(have or "?"))
+        local _, v = ImGui.InputInt("at##at" .. r.id, r.at)
+        if v then r.at = clampAt(v) end
+        ui("SameLine")
+        if button(" Remove ##rm" .. r.id) then removeAt = i end
+    end
+    if removeAt then table.remove(rules, removeAt) end
+
+    ui("Spacing")
+    ImGui.Separator()
+    textColored(C.white, "Add from backpack")
+    local _, nat = ImGui.InputInt("New item at", cfg.newAt)
+    if nat then cfg.newAt = clampAt(nat) end
+
+    local _, f = ImGui.InputText("Search", pick.filter, 32)
+    if f then pick.filter = f end
+
+    refreshPick()
+    local q, shown = pick.filter:lower(), 0
+    for _, e in ipairs(pick.list) do
+        if (q == "" or e.name:lower():find(q, 1, true)) and not ruleIndex(e.id) then
+            shown = shown + 1
+            if shown > 25 then
+                textColored(C.gray, "... more, use Search to narrow it down")
+                break
+            end
+            textColored(C.white, e.name .. "  x" .. e.amount)
+            ui("SameLine", 290)
+            if button(" Add ##add" .. e.id) then addRule(e.id, cfg.newAt) end
+        end
+    end
+    if shown == 0 then textColored(C.gray, "Nothing matches in your backpack.") end
+
+    ui("Spacing")
+    ImGui.Separator()
+    local _, aid = ImGui.InputInt("Add by item id", pick.addId)
+    if aid then pick.addId = math.max(0, aid) end
+    if button(" Add id ") then addRule(pick.addId, cfg.newAt) end
+end
+
+local function tabAdvanced()
+    intInput("Delay after action (ms)", "delay", 0)
+    textColored(C.gray, "Pause after each drop / trash. Higher = slower / safer.")
+    ui("Spacing")
+    intInput("Check list every (ms)", "scanMs", 50)
+    textColored(C.gray, "How often the list is rotated through.")
+    ui("Spacing")
+    textColored(C.gray, "Drop needs open floor next to you. If it says can't drop,")
+    textColored(C.gray, "move and the item is retried after 5 seconds.")
+end
+
+local function drawBody()
+    if S.threadAlive and not S.running then
+        textColored(C.yellow, "Stopping... please wait a second.")
+    elseif not S.running then
+        if bigButton(">  START " .. MODE_NAME[cfg.mode]) then startRun() end
+    else
+        if bigButton("[]  STOP " .. MODE_NAME[cfg.mode],
+            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            stopRun("stopped by user.")
+        end
+    end
+
+    section("CONFIG")
+    textColored(C.white, S.cfgPath or "autodrop_config.txt")
+    ui("SameLine", 170)
+    if button(" Save ", 70, 0) then saveConfig() end
+    ui("SameLine")
+    if button(" Load ", 70, 0) then loadConfig() end
+    ui("SameLine")
+    if button(" Default ", 80, 0) then resetDefaults() end
+
+    if S.uiMsg and os.time() < S.uiUntil then
+        textColored(S.uiOk and C.green or C.red, S.uiMsg)
+    end
+
+    ui("Spacing")
+    for i, name in ipairs(TABS) do
+        if i > 1 then ui("SameLine") end
+        if tab == i then
+            colorButton(" " .. name .. " ", 0, 0,
+                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
+        else
+            if button(" " .. name .. " ", 0, 0) then tab = i end
+        end
+    end
+    ImGui.Separator()
+    ui("Spacing")
+
+    if     tab == 1 then tabStats()
+    elseif tab == 2 then tabItems()
+    else                 tabAdvanced() end
+end
+
+local drawErrors = 0
+AddHook("ondraw", "autodrop_menu", function(dt)
+    local nc, nv = pushTheme()
+    ui("SetNextWindowSize", 440, 0, 4)
+    ImGui.Begin("Auto Drop / Trash")
+    local widthPushed = ui("PushItemWidth", 200)
+
+    if drawErrors < 3 then
+        local ok, err = pcall(drawBody)
+        if not ok then
+            drawErrors = drawErrors + 1
+            say("`4[Auto Drop] `wMenu error: " .. tostring(err))
+        end
+    end
+
+    if widthPushed then ui("PopItemWidth") end
+    ImGui.End()
+    popTheme(nc, nv)
+end)
+
+loadConfig(true)
+say("`2[Auto Drop] `wloaded." .. (S.cfgPath and " Config loaded." or ""))
+
+end  -- startAutoDrop
+
 ---------------- LOADER MENU ---------------------------
 --====================================================
 --  /buybgl - always-on helper (works with or without a launched script)
@@ -6109,6 +6603,7 @@ local LOADER_OPTIONS = {
     { name = "Auto Crystal Combine",  run = startAutoCrystal },
     { name = "Auto Geiger Charger",   run = startAutoCharger },
     { name = "Tax to UWS",            run = startTaxToUWS },
+    { name = "Auto Drop / Trash",     run = startAutoDrop },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

@@ -6738,10 +6738,12 @@ local BACKENDS = {
         if ok then return r == true end
         return nil
     end },
-    { name = "GetAsyncKeyState", down = function(k) return winState("GetAsyncKeyState", k) end },
+    -- GetKeyState follows the game's own input queue, so it ignores keys pressed in other windows.
     { name = "GetKeyState",      down = function(k) return winState("GetKeyState", k) end },
-    { name = "IsKeyDown",        down = function(k) return globalKey("IsKeyDown", k) end },
-    { name = "IsKeyPressed",     pressed = function(k) return globalKey("IsKeyPressed", k) end },
+    -- these see the whole system (even other windows) -> "global": gated by a game-focus check
+    { name = "GetAsyncKeyState", global = true, down = function(k) return winState("GetAsyncKeyState", k) end },
+    { name = "IsKeyDown",        global = true, down = function(k) return globalKey("IsKeyDown", k) end },
+    { name = "IsKeyPressed",     global = true, pressed = function(k) return globalKey("IsKeyPressed", k) end },
 }
 
 local function pickBackend()
@@ -6831,11 +6833,77 @@ local function toggleHidden()
         .. " - type `9/loader `wor press `9" .. HK.name:upper() .. " `wto " .. (UI.hidden and "show" or "hide") .. " them")
 end
 
+-- Is the game window the one in front? true / false, or nil when this executor can't tell.
+local function focusApi()
+    local okIO, gio = pcall(function() return ImGui.GetIO() end)
+    if okIO and gio ~= nil then
+        local ok, v = pcall(function() return gio.AppFocusLost end)
+        if ok and type(v) == "boolean" then return not v end
+    end
+    for _, fn in ipairs({ "IsGameFocused", "IsAppFocused", "IsWindowFocused", "IsFocused", "HasFocus" }) do
+        local f = _G[fn]
+        if type(f) == "function" then
+            local ok, r = pcall(f)
+            if ok and type(r) == "boolean" then return r end
+        end
+    end
+    return nil
+end
+
+-- Fallback when there is no focus API: ask Windows which program is in front, through a tiny
+-- PowerShell script run in the background (no game freeze; the answer arrives about half a second later).
+local FG_PS = [==[
+Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int p);'
+$m = New-Object System.Threading.Mutex($false, "Global\BenLoaderFg")
+if (-not $m.WaitOne(0)) { exit }
+$f = "$PSScriptRoot\benloader_fg.txt"
+while ($true) {
+    $p = 0
+    [void][N.W]::GetWindowThreadProcessId([N.W]::GetForegroundWindow(), [ref]$p)
+    $n = ""
+    try { $n = (Get-Process -Id $p -ErrorAction Stop).ProcessName } catch {}
+    try { [IO.File]::WriteAllText($f, $n) } catch {}
+    if (-not (Get-Process | Where-Object { $_.ProcessName -like "Growtopia*" })) { break }
+    Start-Sleep -Milliseconds 150
+}
+]==]
+
+-- A tiny background PowerShell loop keeps "which program is in front" in benloader_fg.txt
+-- (refreshed every ~150 ms). The hotkey just READS that file, so the check is instant and
+-- a key pressed while another window is in front is ignored without any flicker.
+local function startFgDaemon()
+    if HK.fgStarted then return true end
+    pcall(os.remove, "benloader_fg.txt")
+    local ok, f = pcall(io.open, "benloader_fg.ps1", "w")
+    if not (ok and f) then return false end
+    if not pcall(function() f:write(FG_PS) f:close() end) then return false end
+    local okp, h = pcall(io.popen,
+        'start "" /B powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "benloader_fg.ps1"')
+    if not okp or not h then return false end
+    pcall(function() h:close() end)
+    HK.fgStarted, HK.fgStartClock = true, os.clock()
+    return true
+end
+
+local function readFg()                          -- name of the program in front, nil = unknown yet
+    local name
+    pcall(function()
+        local f = io.open("benloader_fg.txt", "r")
+        if f then name = f:read("*a") f:close() end
+    end)
+    if name and name:match("%S") then return name end
+    return nil
+end
+
 local function hotkeyTick()
     if not HK.bk then
         if os.clock() - HK.retry < 3 then return end   -- keep retrying quietly
         HK.retry = os.clock()
         if not pickBackend() then return end
+    end
+    -- global key readers see keys pressed in ANY window: start the focus watcher once
+    if HK.bk.global and not HK.noFg and not HK.fgStarted and focusApi() == nil then
+        if not startFgDaemon() then HK.noFg = true end
     end
     if HK.capturing then
         local k = captureTick()
@@ -6863,7 +6931,22 @@ local function hotkeyTick()
     end
     if fired then
         HK.last = os.clock()
-        toggleHidden()
+        if b.global and not HK.noFg then
+            local f = focusApi()
+            if f == true then
+                toggleHidden()
+            elseif f == nil then
+                local name = readFg()
+                if name then
+                    if name:lower():find("growtopia", 1, true) then toggleHidden() end
+                elseif HK.fgStarted and os.clock() - HK.fgStartClock > 5 then
+                    HK.noFg = true               -- watcher never answered: stop gating
+                    toggleHidden()
+                end                              -- else: watcher still starting, ignore this press
+            end                                  -- f == false: game isn't in front, ignore
+        else
+            toggleHidden()
+        end
     end
 end
 
@@ -6898,6 +6981,7 @@ local function dumpKeySupport()                   -- prints what this executor o
     names(realImGui, "ImGui key names")
     names(_G, "Global key names")
     LogToConsole("`2[Ben Loader] `wKey reading in use: `9" .. (HK.bk and HK.bk.name or "none"))
+    LogToConsole("`2[Ben Loader] `wGame-focus check: `9" .. tostring(focusApi()) .. " `w(nil = unknown, uses PowerShell fallback)")
 end
 
 local function drawHotkeySection()             -- one compact row

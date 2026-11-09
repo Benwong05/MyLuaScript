@@ -5486,13 +5486,629 @@ say("`2[Auto Charger] `wv2 loaded." .. (S.cfgPath and " Config loaded." or "")
 
 end  -- startAutoCharger
 
+--====================================================
+--  TAX TO UWS  (module for Ben Loader)
+--  Stand on the tile between the Princess and the Telephone:
+--    Princess  = tile LEFT of you      Telephone = tile RIGHT of you
+--  Loop: while you hold fewer than "Drop at" items -> Tax to P-Gems via the
+--  telephone, wrench the Princess, buy. Once you hold enough -> drop a stack.
+--  Uses the loader's shared helpers (C, ui, textColored, section, button,
+--  bigButton, colorButton, rowv, pushTheme, popTheme).
+--====================================================
+local function startTaxToUWS()
+
+---------------- SETTINGS (defaults) -----------------
+local cfg = {
+    delay      = 200,        -- ms between each step
+    phoneNum   = "12345",    -- telephone number dialled for the tax
+    itemId     = 12600,      -- item that is counted / dropped
+    dropAt     = 249,        -- below this many -> keep buying; at/above -> drop
+    dropCount  = 248,        -- how many to drop each time
+    buyCount   = 2,          -- buy_count sent to the Princess
+}
+
+local CONFIG_PATHS = { "taxuws_config.txt", "scripts/taxuws_config.txt", "/sdcard/taxuws_config.txt" }
+local SAVE_KEYS = { "delay", "phoneNum", "itemId", "dropAt", "dropCount", "buyCount" }
+local SAVE_SET = {}
+for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
+
+---------------- STATE -------------------------------
+local S = {
+    running = false, threadAlive = false,
+    stage = "Idle", stageCol = C.white,
+    cycles = 0, drops = 0, dropped = 0,
+    telX = 0, telY = 0, prX = 0, prY = 0,
+    startedAt = 0, runAccum = 0,
+    cfgPath = nil, uiMsg = nil, uiOk = true, uiUntil = 0,
+}
+
+---------------- HELPERS -----------------------------
+local function say(msg) LogToConsole(msg) end
+local function setMsg(text, ok) S.uiMsg, S.uiOk, S.uiUntil = text, ok, os.time() + 5 end
+local function setStage(text, col) S.stage, S.stageCol = text, col or C.white end
+local function comma(n)
+    local r = tostring(math.floor(n)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (r:gsub("^,", ""))
+end
+local function fmtClock(secs)
+    secs = math.max(0, math.floor(secs))
+    local h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    if h > 0 then return string.format("%dh %02dm %02ds", h, m, s) end
+    return string.format("%dm %02ds", m, s)
+end
+
+local function nap(ms)                            -- sleep that reacts quickly to STOP
+    local left = ms
+    while left > 0 and S.running do
+        local s = math.min(250, left)
+        Sleep(s)
+        left = left - s
+    end
+end
+
+local function myTile()
+    local ok, x, y = pcall(function()
+        local p = GetLocal().pos
+        return p.x // 32, p.y // 32
+    end)
+    if ok then return x, y end
+    return nil, nil
+end
+
+local function inv(id)
+    local ok, n = pcall(function()
+        for _, item in pairs(GetInventory()) do
+            if item.id == id then return item.amount end
+        end
+        return 0
+    end)
+    if ok and type(n) == "number" then return n end
+    return 0
+end
+
+local function wrench(x, y)
+    SendPacketRaw(false, {
+        type = 3, state = 32, value = 32,
+        px = x, py = y, x = x * 32, y = y * 32,
+    })
+end
+
+---------------- CONFIG SAVE / LOAD ------------------
+local function saveConfig(silent)
+    local lines = {}
+    for _, k in ipairs(SAVE_KEYS) do lines[#lines + 1] = k .. "=" .. tostring(cfg[k]) end
+    local data = table.concat(lines, "\n") .. "\n"
+    local order = {}
+    if S.cfgPath then order[1] = S.cfgPath end
+    for _, p in ipairs(CONFIG_PATHS) do order[#order + 1] = p end
+    for _, p in ipairs(order) do
+        local ok, f = pcall(io.open, p, "w")
+        if ok and f then
+            if pcall(function() f:write(data) f:close() end) then
+                S.cfgPath = p
+                if not silent then setMsg("Config saved (" .. p .. ")", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("Could not save config (no writable path)", false) end
+    return false
+end
+
+local function loadConfig(silent)
+    for _, p in ipairs(CONFIG_PATHS) do
+        local ok, f = pcall(io.open, p, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            if rok and data and data ~= "" then
+                for line in data:gmatch("[^\r\n]+") do
+                    local k, v = line:match("^(%w+)=(.*)$")
+                    if k and SAVE_SET[k] and cfg[k] ~= nil then
+                        if type(cfg[k]) == "number" then cfg[k] = tonumber(v) or cfg[k]
+                        else cfg[k] = v end
+                    end
+                end
+                cfg.delay     = math.max(0, cfg.delay)
+                cfg.dropAt    = math.max(1, cfg.dropAt)
+                cfg.dropCount = math.max(1, cfg.dropCount)
+                cfg.buyCount  = math.max(1, cfg.buyCount)
+                S.cfgPath = p
+                if not silent then setMsg("Config loaded", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("No saved config found", false) end
+    return false
+end
+
+---------------- MAIN LOOP ---------------------------
+local function mainLoop()
+    local mx, my = myTile()
+    if not mx then
+        say("`4[Tax to UWS] `wCan't read your position.")
+        return
+    end
+    S.telX, S.telY = mx + 1, my       -- telephone: right side
+    S.prX,  S.prY  = mx - 1, my       -- princess: left side
+    say(string.format("`2[Tax to UWS] `wStanding at %d,%d | Telephone %d,%d | Princess %d,%d",
+        mx, my, S.telX, S.telY, S.prX, S.prY))
+
+    while S.running do
+        if inv(cfg.itemId) < cfg.dropAt then
+            setStage("Tax to P-Gems", C.green)
+            SendPacket(2, "action|dialog_return\ndialog_name|telephone\nnum|" .. cfg.phoneNum
+                .. "|\nx|" .. S.telX .. "|\ny|" .. S.telY .. "|\nbuttonClicked|tax_to_pgems")
+            nap(cfg.delay)
+            if not S.running then break end
+
+            setStage("Wrenching Princess", C.cyan)
+            wrench(S.prX, S.prY)
+            nap(cfg.delay)
+            if not S.running then break end
+
+            setStage("Buying", C.yellow)
+            SendPacket(2, "action|dialog_return\ndialog_name|princess_dialog\nx|" .. S.prX
+                .. "|\ny|" .. S.prY .. "|\nbuyitem|actuallybuyitem13|\nbuy_count|" .. cfg.buyCount)
+            S.cycles = S.cycles + 1
+            nap(cfg.delay)
+        else
+            setStage("Dropping", C.yellow)
+            SendPacket(2, "action|dialog_return\ndialog_name|drop\nitem_drop|" .. cfg.itemId
+                .. "|\nitem_count|" .. cfg.dropCount)
+            S.drops = S.drops + 1
+            S.dropped = S.dropped + cfg.dropCount
+            nap(cfg.delay)
+        end
+        if cfg.delay <= 0 then Sleep(10) end      -- never spin the game thread
+    end
+end
+
+local function stopRun(reason)
+    if not S.running then return end
+    S.running = false
+    S.runAccum = S.runAccum + (os.time() - S.startedAt)
+    setStage("Stopping", C.yellow)
+    say("`4[Tax to UWS] Stopped: `w" .. (reason or "stopped by user."))
+end
+
+local function startRun()
+    if S.threadAlive then setMsg("Still stopping, try again in a second.", false) return end
+    if type(SendPacketRaw) ~= "function" then setMsg("SendPacketRaw not found in this executor.", false) return end
+    saveConfig(true)
+    S.running, S.threadAlive = true, true
+    S.startedAt = os.time()
+    setStage("Starting", C.green)
+    say("`2[Tax to UWS] `wStarted.")
+    RunThread(function()
+        local ok, err = pcall(mainLoop)
+        if not ok then say("`4[Tax to UWS] `wError: " .. tostring(err)) end
+        if S.running then
+            S.running = false
+            S.runAccum = S.runAccum + (os.time() - S.startedAt)
+        end
+        S.threadAlive = false
+        setStage("Idle", C.white)
+    end)
+end
+
+---------------- MENU ---------------------------------
+local DEFAULTS = {}
+for _, k in ipairs(SAVE_KEYS) do DEFAULTS[k] = cfg[k] end
+
+local tab  = 1
+local TABS = { "Stats", "Settings" }
+
+local function intInput(label, key, min)
+    local _, v = ImGui.InputInt(label, cfg[key])
+    if v then cfg[key] = math.max(min, v) end
+end
+
+local function resetCount()
+    S.cycles, S.drops, S.dropped, S.runAccum = 0, 0, 0, 0
+    if S.running then S.startedAt = os.time() end
+    setMsg("Count reset", true)
+end
+
+local function resetDefaults()
+    for _, k in ipairs(SAVE_KEYS) do cfg[k] = DEFAULTS[k] end
+    setMsg("Settings reset to default", true)
+end
+
+local function statusInfo()
+    if S.threadAlive and not S.running then return "Stopping", C.yellow end
+    if not S.running then return "Idle", C.white end
+    return S.stage, S.stageCol
+end
+
+local function tabStats()
+    local label, col = statusInfo()
+    textColored(col, label)
+    ui("SameLine")
+    local mx, my = myTile()
+    textColored(C.gray, "   you at " .. (mx and (mx .. "," .. my) or "unknown"))
+
+    ui("Spacing")
+    local have = inv(cfg.itemId)
+    textColored(C.white, "Holding   " .. have .. " / " .. cfg.dropAt)
+    progressBar(math.min(1, have / math.max(1, cfg.dropAt)))
+    textColored(C.gray, "Drops a stack of " .. cfg.dropCount .. " when it reaches " .. cfg.dropAt .. ".")
+
+    ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+
+    local elapsed = S.runAccum + (S.running and (os.time() - S.startedAt) or 0)
+    rowv("Buy cycles", comma(S.cycles), C.white)
+    ui("Spacing")
+    rowv("Drops", comma(S.drops), C.white)
+    ui("Spacing")
+    rowv("Items dropped", comma(S.dropped), C.green)
+    ui("Spacing")
+    rowv("Run time", fmtClock(elapsed), C.white)
+    if S.running and S.telX ~= 0 then
+        ui("Spacing")
+        rowv("Telephone", S.telX .. ", " .. S.telY, C.gray)
+        rowv("Princess", S.prX .. ", " .. S.prY, C.gray)
+    end
+    ui("Spacing")
+
+    if button("Reset Count", -1, 30) then resetCount() end
+end
+
+local function tabSettings()
+    textColored(C.white, "Setup")
+    textColored(C.gray, "Stand between them: Princess on your LEFT,")
+    textColored(C.gray, "Telephone on your RIGHT, then press START.")
+    ui("Spacing")
+    ImGui.Separator()
+
+    intInput("Delay (ms)", "delay", 0)
+    textColored(C.gray, "Pause between every step. Higher = slower / safer.")
+    ui("Spacing")
+
+    local _, n = ImGui.InputText("Phone number", cfg.phoneNum, 16)
+    if n then cfg.phoneNum = n end
+
+    intInput("Item id", "itemId", 1)
+    intInput("Drop at", "dropAt", 1)
+    textColored(C.gray, "Keeps buying while you hold fewer than this.")
+    intInput("Drop amount", "dropCount", 1)
+    intInput("Buy count", "buyCount", 1)
+end
+
+local function drawBody()
+    if S.threadAlive and not S.running then
+        textColored(C.yellow, "Stopping... please wait a second.")
+    elseif not S.running then
+        if bigButton(">  START TAX") then startRun() end
+    else
+        if bigButton("[]  STOP TAX",
+            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            stopRun("stopped by user.")
+        end
+    end
+
+    section("CONFIG")
+    textColored(C.white, S.cfgPath or "taxuws_config.txt")
+    ui("SameLine", 170)
+    if button(" Save ", 70, 0) then saveConfig() end
+    ui("SameLine")
+    if button(" Load ", 70, 0) then loadConfig() end
+    ui("SameLine")
+    if button(" Default ", 80, 0) then resetDefaults() end
+
+    if S.uiMsg and os.time() < S.uiUntil then
+        textColored(S.uiOk and C.green or C.red, S.uiMsg)
+    end
+
+    ui("Spacing")
+    for i, name in ipairs(TABS) do
+        if i > 1 then ui("SameLine") end
+        if tab == i then
+            colorButton(" " .. name .. " ", 0, 0,
+                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
+        else
+            if button(" " .. name .. " ", 0, 0) then tab = i end
+        end
+    end
+    ImGui.Separator()
+    ui("Spacing")
+
+    if tab == 1 then tabStats() else tabSettings() end
+end
+
+local drawErrors = 0
+AddHook("ondraw", "taxuws_menu", function(dt)
+    local nc, nv = pushTheme()
+    ui("SetNextWindowSize", 400, 0, 4)
+    ImGui.Begin("Tax to UWS")
+    local widthPushed = ui("PushItemWidth", 220)
+
+    if drawErrors < 3 then
+        local ok, err = pcall(drawBody)
+        if not ok then
+            drawErrors = drawErrors + 1
+            say("`4[Tax to UWS] `wMenu error: " .. tostring(err))
+        end
+    end
+
+    if widthPushed then ui("PopItemWidth") end
+    ImGui.End()
+    popTheme(nc, nv)
+end)
+
+loadConfig(true)
+say("`2[Tax to UWS] `wloaded." .. (S.cfgPath and " Config loaded." or "")
+    .. (type(SendPacketRaw) == "function" and "" or " `4WARNING: SendPacketRaw not found!"))
+
+end  -- startTaxToUWS
+
 ---------------- LOADER MENU ---------------------------
+--====================================================
+--  /buybgl - always-on helper (works with or without a launched script)
+--  Type /buybgl in chat to toggle ON/OFF. While ON, wrenching a Telephone
+--  automatically: dials 53785 -> picks Blue Gem Lock -> clicks Thank you,
+--  with the dialogs hidden.
+--
+--  /buybgl   toggle ON/OFF (the only command)
+--  The world-chat report is said only when you switch it ON or OFF.
+--====================================================
+do
+    local BGL = {
+        on       = false,
+        debug    = false,
+        number   = "53785",
+        want     = "blue gem lock",  -- button label to pick (case-insensitive)
+        thanks   = "thank",          -- button label to finish with
+        delayMs  = 35,               -- pause (ms) before each reply
+        lastAct  = nil,              -- time of our last reply
+        -- SAFETY: everything is driven by YOUR wrench packets, never by what the
+        -- server sends. One wrench = one dial = one buy = one thank-you click.
+        c1 = 0, c2 = 0, c3 = 0,      -- dial / buy / thank-you credits
+        grantAt  = 0,                -- credits expire 5 s after the last grant
+        bought   = 0,                -- this session
+        wx = nil, wy = nil,          -- last wrenched tile
+    }
+    local TAG  = "`b[`2Buy`9BGL`B]"
+
+    local function blog(m) LogToConsole("`2[BuyBGL] `o" .. tostring(m)) end
+    local function bdbg(m) if BGL.debug then blog(m) end end
+    local function bclean(t) return (tostring(t or ""):gsub("`.", "")) end
+    local function fresh() return os.time() - BGL.grantAt <= 5 end
+    local function touch() BGL.grantAt = os.time() end
+    local function dropOld()
+        if not fresh() then BGL.c1, BGL.c2, BGL.c3 = 0, 0, 0 end
+    end
+
+    -- One real wrench of yours = one dial credit. Both the text form
+    -- ("action|wrench") and the raw tile packet (type 3, item 32) call this;
+    -- a second copy within 50 ms (several hooks firing) is ignored.
+    local function grantWrench()
+        if not BGL.on then return end
+        local c = os.clock()
+        if BGL.wrenchClock ~= nil and c >= BGL.wrenchClock and c - BGL.wrenchClock <= 0.05 then
+            return
+        end
+        BGL.wrenchClock = c
+        dropOld()
+        BGL.c1 = BGL.c1 + 1
+        touch()
+    end
+
+    local function bfield(var, name, idx)
+        local ok, v = pcall(function() return var[name] end)
+        if ok and v ~= nil then return v end
+        ok, v = pcall(function() return var[idx] end)
+        if ok and v ~= nil then return v end
+        return nil
+    end
+
+    ------------------------------------------------ world-chat report
+    -- exactly ONE line when switched ON and ONE line when switched OFF
+    local function reportToggle(on)
+        SendPacket(2, "action|input\n|text|" .. TAG .. " `3Auto Buy BGL "
+            .. (on and "`2ON" or "`4OFF"))
+    end
+
+    ------------------------------------------------ dialog handling
+    local function later(ms, fn)
+        if ms <= 0 then fn() return end
+        if type(RunThread) == "function" then
+            local ok = pcall(RunThread, function()
+                if type(Sleep) == "function" then pcall(Sleep, ms) end
+                fn()
+            end)
+            if ok then return end
+        end
+        fn()
+    end
+
+    local function buildReply(dialog, dname, extra)
+        local p = "action|dialog_return\ndialog_name|" .. dname .. "\n"
+        local got = false
+        for k, v in dialog:gmatch("embed_data|([^|\n]+)|([^|\n]*)") do
+            p = p .. k .. "|" .. v .. "|\n"
+            got = true
+        end
+        if not got and BGL.wx and BGL.wy then
+            p = p .. "tilex|" .. BGL.wx .. "|\ntiley|" .. BGL.wy .. "|\n"
+        end
+        return p .. extra
+    end
+
+    local function send(pkt, what)
+        BGL.lastAct = os.time()
+        later(BGL.delayMs, function()
+            SendPacket(2, pkt)
+            bdbg("sent (" .. what .. "):\n" .. pkt)
+        end)
+    end
+
+    local function findButton(dialog, word)
+        for name, label in dialog:gmatch("add_button|([^|\n]*)|([^|\n]*)|") do
+            if bclean(label):lower():find(word, 1, true) then return name end
+        end
+        return nil
+    end
+
+    local function isPhoneDialog(dialog, dname)
+        if not dialog:find("add_text_input|", 1, true) then return false end
+        local low = bclean(dialog):lower()
+        return low:find("telephone", 1, true) ~= nil
+            or low:find("phone #", 1, true) ~= nil
+            or low:find("dial a number", 1, true) ~= nil
+            or dname:lower():find("phone", 1, true) ~= nil
+    end
+
+    local function onVariant(var)
+        if not BGL.on then return false end
+        local fname = bfield(var, "v1", 0)
+        if fname == "OnTextOverlay" or fname == "OnTalkBubble" or fname == "OnConsoleMessage" then
+            local low = (bclean(bfield(var, "v2", 1)) .. " " .. bclean(bfield(var, "v3", 2))):lower()
+            if low:find("you got", 1, true) and low:find("blue gem lock", 1, true) then
+                return true                                -- hide the banner
+            end
+            return false
+        end
+        if fname ~= "OnDialogRequest" then return false end
+        local dialog = tostring(bfield(var, "v2", 1) or "")
+        local dname  = dialog:match("end_dialog|([^|]*)|") or ""
+        if BGL.debug then
+            blog(string.format("dialog seen: name=%s\n%s", dname, dialog))
+        end
+
+        -- No step counter: every dialog is recognised by what it contains, so
+        -- spam-wrenching (several buys at once) can't mix the steps up.
+
+        -- 1) telephone -> type the number, press Dial
+        if isPhoneDialog(dialog, dname) then
+            local input  = dialog:match("add_text_input|([^|]*)|") or "num"
+            local okText = dialog:match("end_dialog|[^|]*|[^|]*|([^|]*)|") or "Dial"
+            local btn = bclean(okText):lower()
+            if btn == "" then btn = "dial" end
+            dropOld()
+            if BGL.c1 > 0 then
+                BGL.c1, BGL.c2 = BGL.c1 - 1, BGL.c2 + 1
+                touch()
+                send(buildReply(dialog, dname,
+                    input .. "|" .. BGL.number .. "\nbuttonClicked|" .. btn .. "\n"), "dial")
+            else
+                blog("telephone dialog without a wrench from you - ignored")
+            end
+            return true
+        end
+
+        -- 2) menu with a Blue Gem Lock button -> click it
+        local b = findButton(dialog, BGL.want)
+        if b then
+            dropOld()
+            if BGL.c2 > 0 then
+                BGL.c2, BGL.c3 = BGL.c2 - 1, BGL.c3 + 1                 -- one wrench = one buy
+                touch()
+                send(buildReply(dialog, dname, "buttonClicked|" .. b .. "\n"), "pick BGL")
+            end
+            return true                                                 -- never buy without a credit
+        end
+
+        -- 3) "Thank you" dialog of the telephone -> click Thank you
+        local inFlow = BGL.lastAct ~= nil and (os.time() - BGL.lastAct) <= 6
+        local isPhoneName = dname:lower():find("phone", 1, true) ~= nil
+        local t = findButton(dialog, BGL.thanks)
+        if t and (isPhoneName or inFlow) then
+            dropOld()
+            if BGL.c3 > 0 then
+                BGL.c3 = BGL.c3 - 1
+                send(buildReply(dialog, dname, "buttonClicked|" .. t .. "\n"), "thank you")
+                BGL.bought = BGL.bought + 1
+                blog("Bought Blue Gem Lock #" .. BGL.bought)
+            end
+            return true
+        end
+
+        -- anything else that belongs to the buy flow: hide it
+        local low = bclean(dialog):lower()
+        if low:find("blue gem lock", 1, true) or (inFlow and isPhoneName) then
+            bdbg("hid extra dialog: " .. dname)
+            return true
+        end
+        return false
+    end
+
+    local function onSend(ptype, packet)
+        if type(packet) ~= "string" then return false end
+
+        local cmd = packet:match("action|input\n|text|(/buybgl[^\n]*)")
+        if cmd then
+            BGL.on = not BGL.on
+            BGL.c1, BGL.c2, BGL.c3 = 0, 0, 0
+            if BGL.on then BGL.bought = 0 end
+            local m = BGL.on and "/buybgl ON - wrench a Telephone" or "/buybgl OFF"
+            blog(m)
+            reportToggle(BGL.on)
+            return true   -- don't send the command to the server
+        end
+
+        if packet:find("action|wrench", 1, true) then grantWrench() end
+        if packet:find("action|wrench", 1, true) then
+            BGL.wx = packet:match("|x|(%-?%d+)") or BGL.wx
+            BGL.wy = packet:match("|y|(%-?%d+)") or BGL.wy
+        end
+        if BGL.debug and packet:find("dialog_return", 1, true) then
+            blog("OUTGOING:\n" .. packet)
+        end
+        return false
+    end
+
+    -- Register under both capitalisations, but run the handler ONCE per event
+    -- and hand the SAME answer to both hooks. (If one of them answered
+    -- "false", the executor could un-hide the dialog.)
+    local WRENCH_ID = 32
+    local function onSendRaw(pkt)
+        if not BGL.on then return false end
+        local ok, t, v = pcall(function() return pkt.type, pkt.value end)
+        if ok and t == 3 and v == WRENCH_ID then
+            local okp, px, py = pcall(function() return pkt.px, pkt.py end)
+            if okp and px and py then BGL.wx, BGL.wy = tostring(px), tostring(py) end
+            grantWrench()
+        end
+        return false
+    end
+
+    local function reg(events, name, fn, keyOf)
+        local lastKey, lastRes, lastT, lastC
+        for i, ev in ipairs(events) do
+            pcall(AddHook, ev, name .. i, function(...)
+                local key = keyOf(...)
+                local t, c = os.time(), os.clock()
+                if key ~= nil and key == lastKey and t == lastT and (c - lastC) < 0.01 then
+                    return lastRes
+                end
+                local res = fn(...)
+                lastKey, lastRes, lastT, lastC = key, res, t, c
+                return res
+            end)
+        end
+    end
+    reg({ "OnVariant", "onvariant" }, "buybgl_v", onVariant, function(var)
+        local v1 = bfield(var, "v1", 0)
+        if v1 ~= "OnDialogRequest" then return nil end      -- not worth caching
+        return tostring(bfield(var, "v2", 1))
+    end)
+    reg({ "onsendpacketraw", "OnSendPacketRaw" }, "buybgl_r", onSendRaw, function() return nil end)
+    reg({ "OnSendPacket", "onsendpacket" }, "buybgl_s", onSend, function(_, packet)
+        return type(packet) == "string" and packet or nil
+    end)
+    LogToConsole("`2[BuyBGL] `oReady. Type /buybgl to toggle.")
+end
+
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
     { name = "Auto Geiger",           run = startGeiger },
     { name = "Auto Crystal Combine",  run = startAutoCrystal },
     { name = "Auto Geiger Charger",   run = startAutoCharger },
+    { name = "Tax to UWS",            run = startTaxToUWS },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil }
 

@@ -2,29 +2,45 @@
 --  BEN LOADER - pick ONE script to launch
 --  Nothing runs until you select it in the menu below and press
 --  "Launch Selected Script". Only the chosen script's hooks/menu get
---  registered; the other one never starts. To switch to the other
---  script later, reload this file and pick again.
+--  registered; the other ones never start. To switch to another
+--  script later, press "< Return" in its window.
 --
---  All the menus (this loader, Auto Super Broadcast, Vend Helper, Auto Geiger, Auto Crystal)
---  share the SAME theme/widget helpers below, so they all look and
---  behave the same way.
+--  V9 UI: every menu (loader, Auto SB, Vend Helper, Auto Geiger, Auto Crystal,
+--  Charger, Tax, Drop) shares the SAME design system below:
+--  dark charcoal + orange accent, rounded cards, sidebar navigation,
+--  orange ON/OFF toggles. Change the look in ONE place (the PALETTE).
 --====================================================
 
 -- Set to false if your menu glitches: falls back to plain ImGui widgets.
 local FANCY_UI = true
+-- true = show the normal window title bar, false = custom header (logo + title + Return)
+local SHOW_TITLEBAR = false
 
-local C = {                                   -- colours (r, g, b, a)
-    gold   = { 1.00, 0.82, 0.25, 1 },
-    green  = { 0.35, 0.90, 0.45, 1 },
-    red    = { 1.00, 0.40, 0.40, 1 },
+---------------- PALETTE ------------------------------
+local ACC        = { 0.93, 0.40, 0.08, 1 }    -- main orange
+local ACC_HOVER  = { 1.00, 0.50, 0.16, 1 }
+local ACC_ACTIVE = { 0.78, 0.31, 0.05, 1 }
+local BG         = { 0.070, 0.070, 0.075, 0.98 }
+local PANEL      = { 0.100, 0.100, 0.106, 1.00 }
+local FIELD      = { 0.145, 0.145, 0.152, 1.00 }
+local FIELD_HOV  = { 0.195, 0.195, 0.205, 1.00 }
+local LINE       = { 0.180, 0.180, 0.190, 1.00 }
+local CLEAR      = { 0, 0, 0, 0 }
+
+local C = {                                   -- text colours (r, g, b, a)
+    accent = ACC,
+    gold   = { 1.00, 0.64, 0.28, 1 },         -- light accent (highlights)
+    green  = { 0.30, 0.85, 0.45, 1 },
+    red    = { 0.95, 0.36, 0.36, 1 },
     cyan   = { 0.45, 0.80, 1.00, 1 },
-    yellow = { 1.00, 0.88, 0.35, 1 },
-    gray   = { 0.45, 0.47, 0.52, 1 },
-    white  = { 0.95, 0.95, 0.95, 1 },
-    purple = { 0.45, 0.45, 0.95, 1 },
+    yellow = { 1.00, 0.80, 0.30, 1 },
+    gray   = { 0.52, 0.52, 0.56, 1 },
+    white  = { 0.93, 0.93, 0.94, 1 },
+    purple = ACC,
 }
 
 -- Calls an optional ImGui function; silently does nothing if it doesn't exist.
+-- Returns (ok, result) like pcall.
 local function ui(name, ...)
     if not FANCY_UI then return false end
     local f = ImGui[name]
@@ -61,34 +77,65 @@ local function textColored(c, text)
     end
 end
 
----------------- THEME (dark look) -------------------
+---------------- THEME (dark + orange) ----------------
 -- PushStyleColor / PushStyleVar wrappers. They work out which signature
 -- your ImGui uses, and just do nothing if it isn't supported.
 local styleMode = nil                         -- "rgba" | "vec4" | "none"
 
 local THEME_COLORS = {
-    { "WindowBg",         { 0.05, 0.05, 0.06, 0.97 } },
-    { "TitleBg",          { 0.04, 0.04, 0.05, 1.00 } },
-    { "TitleBgActive",    { 0.04, 0.04, 0.05, 1.00 } },
-    { "TitleBgCollapsed", { 0.04, 0.04, 0.05, 1.00 } },
-    { "Separator",        { 0.20, 0.20, 0.23, 1.00 } },
-    { "Border",           { 0.50, 0.50, 0.68, 1.00 } },   -- button / input outline
-    { "Button",           { 0.09, 0.09, 0.11, 1.00 } },
-    { "ButtonHovered",    { 0.17, 0.17, 0.23, 1.00 } },
-    { "ButtonActive",     { 0.27, 0.27, 0.45, 1.00 } },
-    { "FrameBg",          { 0.13, 0.13, 0.15, 1.00 } },
-    { "FrameBgHovered",   { 0.17, 0.17, 0.20, 1.00 } },
-    { "FrameBgActive",    { 0.20, 0.20, 0.25, 1.00 } },
-    { "PlotHistogram",    { 0.45, 0.45, 0.95, 1.00 } },
+    { "WindowBg",          BG },
+    { "ChildBg",           PANEL },
+    { "PopupBg",           { 0.09, 0.09, 0.095, 0.98 } },
+    { "Text",              C.white },
+    { "TextDisabled",      C.gray },
+    { "TitleBg",           { 0.06, 0.06, 0.065, 1.00 } },
+    { "TitleBgActive",     { 0.06, 0.06, 0.065, 1.00 } },
+    { "TitleBgCollapsed",  { 0.06, 0.06, 0.065, 1.00 } },
+    { "Border",            LINE },
+    { "BorderShadow",      CLEAR },
+    { "Separator",         LINE },
+    { "SeparatorHovered",  ACC_HOVER },
+    { "SeparatorActive",   ACC },
+    { "Button",            FIELD },
+    { "ButtonHovered",     FIELD_HOV },
+    { "ButtonActive",      ACC_ACTIVE },
+    { "FrameBg",           FIELD },
+    { "FrameBgHovered",    FIELD_HOV },
+    { "FrameBgActive",     { 0.23, 0.23, 0.24, 1.00 } },
+    { "CheckMark",         ACC },
+    { "SliderGrab",        ACC },
+    { "SliderGrabActive",  ACC_HOVER },
+    { "Header",            { 0.93, 0.40, 0.08, 0.35 } },
+    { "HeaderHovered",     { 0.93, 0.40, 0.08, 0.55 } },
+    { "HeaderActive",      { 0.93, 0.40, 0.08, 0.75 } },
+    { "PlotHistogram",     ACC },
+    { "PlotHistogramHovered", ACC_HOVER },
+    { "ScrollbarBg",       CLEAR },
+    { "ScrollbarGrab",     { 0.26, 0.26, 0.28, 1.00 } },
+    { "ScrollbarGrabHovered", { 0.36, 0.36, 0.38, 1.00 } },
+    { "ScrollbarGrabActive",  ACC },
+    { "TextSelectedBg",    { 0.93, 0.40, 0.08, 0.35 } },
+    { "ResizeGrip",        { 0.93, 0.40, 0.08, 0.25 } },
+    { "ResizeGripHovered", { 0.93, 0.40, 0.08, 0.60 } },
+    { "ResizeGripActive",  ACC },
 }
-local THEME_VARS = {                           -- 0 = sharp corners
-    { "WindowRounding",    0 },               -- menu window: sharp
-    { "ChildRounding",     0 },
-    { "PopupRounding",     0 },
-    { "ScrollbarRounding", 0 },
-    { "TabRounding",       0 },
-    { "FrameRounding",     5 },               -- buttons / inputs: rounded
-    { "GrabRounding",      5 },
+local THEME_VARS = {                           -- numbers or { x, y }
+    { "WindowRounding",    12 },
+    { "ChildRounding",     9 },
+    { "PopupRounding",     8 },
+    { "FrameRounding",     7 },
+    { "GrabRounding",      7 },
+    { "ScrollbarRounding", 8 },
+    { "TabRounding",       7 },
+    { "WindowBorderSize",  1 },
+    { "ChildBorderSize",   1 },
+    { "FrameBorderSize",   0 },
+    { "ScrollbarSize",     10 },
+    { "GrabMinSize",       12 },
+    { "WindowPadding",     { 14, 12 } },
+    { "FramePadding",      { 10, 6 } },
+    { "ItemSpacing",       { 8, 8 } },
+    { "ItemInnerSpacing",  { 6, 6 } },
 }
 
 -- Pushes one colour using the given signature. Returns true if the call worked.
@@ -155,6 +202,12 @@ local function pushVar(name, v)
     if not FANCY_UI or type(ImGui.PushStyleVar) ~= "function" then return false end
     local idx = ImGui.StyleVar and ImGui.StyleVar[name]
     if idx == nil then return false end
+    if type(v) == "table" then                -- 2D value: ImVec2 first, loose x,y second
+        if type(ImVec2) == "function" and pcall(ImGui.PushStyleVar, idx, ImVec2(v[1], v[2])) then
+            return true
+        end
+        return (pcall(ImGui.PushStyleVar, idx, v[1], v[2]))
+    end
     return (pcall(ImGui.PushStyleVar, idx, v))
 end
 
@@ -170,21 +223,60 @@ local function popTheme(nc, nv)
     if nv > 0 then ui("PopStyleVar", nv) end
 end
 
+-- push a set of button colours (+ optional text colour); returns how many to pop
+local function pushBtn(base, hover, active, textCol)
+    local n = 0
+    if base   and pushCol("Button", base)         then n = n + 1 end
+    if hover  and pushCol("ButtonHovered", hover) then n = n + 1 end
+    if active and pushCol("ButtonActive", active) then n = n + 1 end
+    if textCol and pushCol("Text", textCol)       then n = n + 1 end
+    return n
+end
+local function popCols(n) if n > 0 then ui("PopStyleColor", n) end end
+
 ---------------- UI WIDGETS --------------------------
--- Section header: gold-white title with a line under it.
+-- Section header: small orange caps title with a line under it.
 local function section(title)
     ui("Spacing")
-    textColored(C.white, title)
+    textColored(C.accent, string.upper(tostring(title)))
     ImGui.Separator()
+    ui("Spacing")
 end
 
--- Button with optional size (w, h); falls back to a plain button.
-local function button(label, w, h)
+-- plain button with optional size (w, h); falls back to a plain button.
+local function rawButton(label, w, h)
     if FANCY_UI and w then
         local ok, r = pcall(ImGui.Button, label, w, h or 0)
         if ok then return r end
     end
     return ImGui.Button(label)
+end
+
+-- Button drawn with its own colour (normal / hovered / pressed).
+local function colorButton(label, w, h, base, hover, active)
+    local n = pushBtn(base, hover, active)
+    local r = rawButton(label, w, h)
+    popCols(n)
+    return r
+end
+
+-- Button. Any label ending in ": ON" / ": OFF" is drawn as a TOGGLE:
+-- orange when ON, dark + dim text when OFF. Everything else = normal button.
+local function button(label, w, h)
+    if FANCY_UI and type(label) == "string" then
+        if label:find(":%s*ON%s*$") then
+            local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+            local r = rawButton(label, w, h)
+            popCols(n)
+            return r
+        elseif label:find(":%s*OFF%s*$") then
+            local n = pushBtn(FIELD, FIELD_HOV, ACC_ACTIVE, C.gray)
+            local r = rawButton(label, w, h)
+            popCols(n)
+            return r
+        end
+    end
+    return rawButton(label, w, h)
 end
 
 -- Button with a real size (ImVec2). Falls back to the normal button.
@@ -193,43 +285,21 @@ local function sizedButton(label, w, h)
         local ok, r = pcall(ImGui.Button, label, ImVec2(w, h))
         if ok then return r end
     end
-    return button(label, w, h)
+    return rawButton(label, w, h)
 end
 
--- Big START / STOP button, centred in the window.
+-- Big full-width START (orange) / STOP (red) button.
 local function bigButton(label, base, hover, active)
-    local w, h = 300, 44
-    local ok, ww = pcall(ImGui.GetWindowWidth)
-    if ok and type(ww) == "number" then
-        w = math.max(200, math.floor(ww * 0.70))
-        ui("SetCursorPosX", math.max(0, math.floor((ww - w) / 2)))
-    end
-    local n = 0
-    if base then
-        if pushCol("Button", base)         then n = n + 1 end
-        if pushCol("ButtonHovered", hover) then n = n + 1 end
-        if pushCol("ButtonActive", active) then n = n + 1 end
-    end
-    local r = sizedButton(label, w, h)
-    if n > 0 then ui("PopStyleColor", n) end
-    return r
-end
-
--- Button drawn with its own colour (normal / hovered / pressed).
-local function colorButton(label, w, h, base, hover, active)
-    local n = 0
-    if pushCol("Button", base)        then n = n + 1 end
-    if pushCol("ButtonHovered", hover) then n = n + 1 end
-    if pushCol("ButtonActive", active) then n = n + 1 end
-    local r = button(label, w, h)
-    if n > 0 then ui("PopStyleColor", n) end
+    local n = pushBtn(base or ACC, hover or ACC_HOVER, active or ACC_ACTIVE, { 1, 1, 1, 1 })
+    local r = sizedButton(label, -1, 40)
+    popCols(n)
     return r
 end
 
 -- "Label            value" with the value in an aligned column.
-local VAL_X = 170                             -- x position of the value column
+local VAL_X = 150                             -- x position of the value column
 local function rowv(label, value, valueColor)
-    textColored(C.white, label)
+    textColored(C.gray, label)
     ui("SameLine", VAL_X)
     textColored(valueColor or C.white, value)
 end
@@ -246,27 +316,157 @@ local function progressBar(frac)
     if FANCY_UI and type(ImGui.ProgressBar) == "function" then
         -- " " as overlay = no text inside the bar
         if type(ImVec2) == "function"
-            and pcall(ImGui.ProgressBar, frac, ImVec2(-1, 18), " ") then return end
+            and pcall(ImGui.ProgressBar, frac, ImVec2(-1, 14), " ") then return end
         if pcall(ImGui.ProgressBar, frac, -1, " ") then return end
         if pcall(ImGui.ProgressBar, frac) then return end
     end
-    textColored(C.purple, bar(frac, 28))
+    textColored(C.accent, bar(frac, 28))
 end
 
-
-
----------------- RETURN TO LOADER ----------------------
+---------------- WINDOW + HEADER + SIDEBAR -------------
 -- ACTIVE.stop is set by the launched script (stops its loops/threads).
 -- The Return button only raises a flag; the loader's own draw hook does the
 -- clean-up (stop script, disable + remove its hooks, show the loader again).
 local ACTIVE = { stop = nil, returnReq = false }
+local CUR_TITLE = ""
+local beginMode = nil                         -- "flags" | "plain"
 
-local function returnButton()                  -- small button, top-left of the window
-    if colorButton(" < Return ", 0, 0,
-        { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 }) then
-        ACTIVE.returnReq = true
+-- Opens the window. Custom look = no title bar (header is drawn by drawHeader).
+-- Always finish with ImGui.End().
+local MIN_W, MIN_H = 430, 300                   -- window can't be resized smaller than this (tiny windows crashed ImGui)
+local function beginWindow(title, w, h, minW, minH)
+    CUR_TITLE = title
+    minW, minH = minW or MIN_W, minH or MIN_H
+    ui("SetNextWindowSize", w or 560, h or 0, 4)      -- first-use size, you can still resize
+    if FANCY_UI and type(ImVec2) == "function" then
+        local done = pcall(ImGui.SetNextWindowSizeConstraints, ImVec2(minW, minH), ImVec2(4000, 4000))
+        if not done then pcall(ImGui.SetNextWindowSizeConstraints, minW, minH, 4000, 4000) end
+    end
+    if FANCY_UI and not SHOW_TITLEBAR and beginMode ~= "plain" then
+        -- 33 = NoTitleBar (1) + NoCollapse (32)
+        if pcall(ImGui.Begin, title, true, 33) then beginMode = "flags" return end
+        beginMode = "plain"
+    end
+    ImGui.Begin(title)
+end
+
+-- Animated rainbow text with a moving white "shine" sweeping across it.
+local function hsv(h, sat, v)
+    local i = math.floor(h * 6)
+    local f = h * 6 - i
+    local p, q, t = v * (1 - sat), v * (1 - f * sat), v * (1 - (1 - f) * sat)
+    i = i % 6
+    if i == 0 then return v, t, p elseif i == 1 then return q, v, p
+    elseif i == 2 then return p, v, t elseif i == 3 then return p, q, v
+    elseif i == 4 then return t, p, v else return v, p, q end
+end
+local function shinyText(text, scale)
+    local t = os.clock()
+    local n = #text
+    local shinePos = (t * 8) % (n + 8) - 4              -- travelling highlight
+    ui("SetWindowFontScale", scale or 1.0)
+    for i = 1, n do
+        local ch = text:sub(i, i)
+        local h = (i * 0.045 + t * 0.25) % 1
+        local r, g, b = hsv(h, 0.78, 1.0)
+        local k = math.max(0, 1 - math.abs(i - shinePos) / 2.5)   -- 0..1 shine amount
+        r, g, b = r + (1 - r) * k * 0.85, g + (1 - g) * k * 0.85, b + (1 - b) * k * 0.85
+        textColored({ r, g, b, 1 }, ch)
+        if i < n then ui("SameLine", 0, 0) end
+    end
+    ui("SetWindowFontScale", 1.0)
+end
+
+-- Logo tile + title on the left, "< Return" on the right.
+local MINIMIZE_REQ = false
+local function drawHeader(title, withReturn, withMin)
+    local ww = 0
+    local okw, w = pcall(ImGui.GetWindowWidth)
+    if okw and type(w) == "number" then ww = w end
+    local _, y = ui("GetCursorPosY")
+
+    local n = pushBtn(ACC, ACC, ACC, { 1, 1, 1, 1 })
+    sizedButton(" B ", 34, 34)                         -- logo tile (not clickable)
+    popCols(n)
+
+    ui("SameLine")
+    if title == "Ben Loader" then
+        if type(y) == "number" then ui("SetCursorPosY", y + 2) end
+        shinyText(title, 1.45)
+    else
+        if type(y) == "number" then ui("SetCursorPosY", y + 8) end
+        textColored(C.white, title)
+    end
+
+    if withReturn then
+        ui("SameLine", math.max(160, ww - 118))
+        if type(y) == "number" then ui("SetCursorPosY", y + 2) end
+        if sizedButton("<  Return", 96, 30) then ACTIVE.returnReq = true end
+    end
+    if withMin then
+        ui("SameLine", math.max(160, ww - 52))
+        if type(y) == "number" then ui("SetCursorPosY", y + 2) end
+        if sizedButton(" _ ", 34, 30) then MINIMIZE_REQ = true end
     end
     ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+end
+
+local function returnButton()                  -- kept name: every module calls this right after Begin
+    drawHeader(CUR_TITLE, true)
+end
+
+-- Sidebar nav item: centered text, orange when active, transparent when not.
+local function navItem(label, active, w, h)
+    local n
+    if active then
+        n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+    else
+        n = pushBtn(CLEAR, FIELD_HOV, ACC_ACTIVE, C.white)
+    end
+    local r = sizedButton(label, w or -1, h or 30)
+    popCols(n)
+    return r
+end
+
+local NAV_W = 104
+local NAV = { contentOpen = false }
+
+local function beginChild(id, w, h, border)
+    if not FANCY_UI or type(ImVec2) ~= "function" or type(ImGui.BeginChild) ~= "function" then
+        return false
+    end
+    return (pcall(ImGui.BeginChild, id, ImVec2(w, h), border and true or false))
+end
+
+-- Sidebar (left) + content card (right). Returns the selected tab index.
+-- After drawing the tab content call navEnd().
+local function navBegin(names, cur)
+    if beginChild("##nav", NAV_W, 0, false) then
+        for i, name in ipairs(names) do
+            if navItem(name, cur == i) then cur = i end
+        end
+        ui("EndChild")
+        ui("SameLine")
+        NAV.contentOpen = beginChild("##content", 0, 0, true)
+    else
+        -- no child windows in this ImGui: plain row of buttons on top
+        for i, name in ipairs(names) do
+            if i > 1 then ui("SameLine") end
+            if navItem(name, cur == i, 0, 30) then cur = i end
+        end
+        ImGui.Separator()
+        ui("Spacing")
+    end
+    return cur
+end
+
+local function navEnd()                        -- safe to call any time, only closes what is open
+    if NAV.contentOpen then
+        NAV.contentOpen = false
+        ui("EndChild")
+    end
 end
 
 local function startAutoSB()
@@ -1130,8 +1330,7 @@ AddHook("ondraw", "autosb_menu", function(dt)
 
     local nc, nv = pushTheme()
 
-    ui("SetNextWindowSize", 440, 0, 4)        -- first-use size, you can still resize
-    ImGui.Begin("Auto SB - PoliceMan v4")
+    beginWindow("Auto SB - PoliceMan v4", 600, 520)
     local widthPushed = ui("PushItemWidth", 240)
     returnButton()
 
@@ -1141,14 +1340,14 @@ AddHook("ondraw", "autosb_menu", function(dt)
         if bigButton(label) then start() end
     else
         if bigButton("[]  STOP SB",
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stop("stopped by user.")
         end
     end
 
     ------------- CONFIG -------------------
     section("CONFIG")
-    textColored(C.white, S.cfgPath or "autosb_config.txt")
+    textColored(C.gray, S.cfgPath or "autosb_config.txt")
     ui("SameLine", 170)
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
@@ -1161,25 +1360,16 @@ AddHook("ondraw", "autosb_menu", function(dt)
     end
 
     ------------- TABS ---------------------
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if     tab == 1 then tabStats()
     elseif tab == 2 then tabBroadcast()
     elseif tab == 3 then tabWebhook()
     else                 tabAdvanced() end
+    navEnd()
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -1697,67 +1887,70 @@ end
 -- others just the value. These wrappers handle both, and the whole
 -- draw is pcall-protected so a wrong function name can't crash anything.
 ---------------------------------------------------------------
+local VTABS = { "Stock", "Sell", "Options" }
+local vTab = 1
 local function drawMenu()
     if not S.menu then return end
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 360, 0, 4)
-    ImGui.Begin("Vend Helper")
-    local widthPushed = ui("PushItemWidth", 200)
+    beginWindow("Vend Helper", 560, 430)
     returnButton()
 
-    section("AUTO ADD / BUY")
-    if button(" Auto Add (own vend): " .. (S.add and "ON" or "OFF") .. " ") then
-        S.add = not S.add
-    end
-    if button(" Auto Buy (other vends): " .. (S.buy and "ON" or "OFF") .. " ") then
-        S.buy = not S.buy
-    end
+    vTab = navBegin(VTABS, vTab)
+    if vTab == 1 then
+        section("AUTO ADD / BUY")
+        if button(" Auto Add (own vend): " .. (S.add and "ON" or "OFF") .. " ") then
+            S.add = not S.add
+        end
+        if button(" Auto Buy (other vends): " .. (S.buy and "ON" or "OFF") .. " ") then
+            S.buy = not S.buy
+        end
 
-    ui("Spacing")
-    local _, amt = ImGui.InputInt("Buy amount", S.amount)
-    if amt then S.amount = clampAmount(amt) end
-    if button("-10", 60) then S.amount = clampAmount(S.amount - 10) end
-    ui("SameLine")
-    if button("+10", 60) then S.amount = clampAmount(S.amount + 10) end
-    ui("SameLine")
-    if button("Max", 60) then S.amount = MAX_AMOUNT end
-
-    section("AUTO SELL (Buying Machine)")
-    if button(" Auto Sell to Buying Machine: " .. (S.sell and "ON" or "OFF") .. " ") then
-        S.sell = not S.sell
-    end
-    if button(" Sell entire stack: " .. (S.sellAll and "ON" or "OFF") .. " ") then
-        S.sellAll = not S.sellAll
-    end
-    if not S.sellAll then
         ui("Spacing")
-        local _, samt = ImGui.InputInt("Sell amount", S.sellAmount)
-        if samt then S.sellAmount = clampSell(samt) end
-        if button("-10", 60) then S.sellAmount = clampSell(S.sellAmount - 10) end
+        local _, amt = ImGui.InputInt("Buy amount", S.amount)
+        if amt then S.amount = clampAmount(amt) end
+        if button("-10", 60) then S.amount = clampAmount(S.amount - 10) end
         ui("SameLine")
-        if button("+10", 60) then S.sellAmount = clampSell(S.sellAmount + 10) end
+        if button("+10", 60) then S.amount = clampAmount(S.amount + 10) end
         ui("SameLine")
-        if button("+100", 60) then S.sellAmount = clampSell(S.sellAmount + 100) end
+        if button("Max", 60) then S.amount = MAX_AMOUNT end
+    elseif vTab == 2 then
+        section("AUTO SELL (Buying Machine)")
+        if button(" Auto Sell to Buying Machine: " .. (S.sell and "ON" or "OFF") .. " ") then
+            S.sell = not S.sell
+        end
+        if button(" Sell entire stack: " .. (S.sellAll and "ON" or "OFF") .. " ") then
+            S.sellAll = not S.sellAll
+        end
+        if not S.sellAll then
+            ui("Spacing")
+            local _, samt = ImGui.InputInt("Sell amount", S.sellAmount)
+            if samt then S.sellAmount = clampSell(samt) end
+            if button("-10", 60) then S.sellAmount = clampSell(S.sellAmount - 10) end
+            ui("SameLine")
+            if button("+10", 60) then S.sellAmount = clampSell(S.sellAmount + 10) end
+            ui("SameLine")
+            if button("+100", 60) then S.sellAmount = clampSell(S.sellAmount + 100) end
+        else
+            textColored(C.gray, "Will sell everything you have of that item.")
+        end
     else
-        textColored(C.gray, "Will sell everything you have of that item.")
-    end
+        section("OPTIONS")
+        if button(" Hide dialog when handled: " .. (S.hide and "ON" or "OFF") .. " ") then
+            S.hide = not S.hide
+        end
+        if button(" Debug output: " .. (S.debug and "ON" or "OFF") .. " ") then
+            S.debug = not S.debug
+        end
 
-    section("OPTIONS")
-    if button(" Hide dialog when handled: " .. (S.hide and "ON" or "OFF") .. " ") then
-        S.hide = not S.hide
+        section("CONFIG")
+        if button(" Save config ") then saveConfig() end
+        ui("SameLine")
+        if button(" Load config ") then loadConfig() end
+        if status ~= "" then textColored(C.gray, status) end
     end
-    if button(" Debug output: " .. (S.debug and "ON" or "OFF") .. " ") then
-        S.debug = not S.debug
-    end
+    navEnd()
 
-    ui("Spacing")
-    ImGui.Separator()
-    if button(" Save config ") then saveConfig() end
-    ui("SameLine")
-    if button(" Load config ") then loadConfig() end
-    if status ~= "" then textColored(C.gray, status) end
-
-    if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end
@@ -3136,14 +3329,14 @@ local function drawBody()
         if bigButton(">  START GEIGER") then startRun() end
     else
         if bigButton("[]  STOP GEIGER",
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stopRun("stopped by user.")
         end
     end
 
     ------------- CONFIG -------------------
     section("CONFIG")
-    textColored(C.white, S.cfgPath or "autogeiger_config.txt")
+    textColored(C.gray, S.cfgPath or "autogeiger_config.txt")
     ui("SameLine", 170)
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
@@ -3156,24 +3349,14 @@ local function drawBody()
     end
 
     ------------- TABS ---------------------
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if     tab == 1 then tabStats()
     elseif tab == 2 then tabItems()
     elseif tab == 3 then tabSettings()
     elseif tab == 4 then tabWebhook()
     else                 tabAdvanced() end
+    navEnd()
 end
 
 local drawErrors = 0
@@ -3195,8 +3378,7 @@ AddHook("ondraw", "gwk_menu", function(dt)
     end
 
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 440, 0, 4)        -- first-use size, you can still resize
-    ImGui.Begin("Auto Geiger")
+    beginWindow("Auto Geiger", 600, 520)
     local widthPushed = ui("PushItemWidth", 240)
     returnButton()
 
@@ -3209,6 +3391,7 @@ AddHook("ondraw", "gwk_menu", function(dt)
     end
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -3783,13 +3966,13 @@ local function drawBody()
         if bigButton(">  START COMBINE") then startRun() end
     else
         if bigButton("[]  STOP COMBINE",
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stopRun("stopped by user.")
         end
     end
 
     section("CONFIG")
-    textColored(C.white, S.cfgPath or "autocrystal_config.txt")
+    textColored(C.gray, S.cfgPath or "autocrystal_config.txt")
     ui("SameLine", 170)
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
@@ -3801,29 +3984,18 @@ local function drawBody()
         textColored(S.uiOk and C.green or C.red, S.uiMsg)
     end
 
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if     tab == 1 then tabStats()
     elseif tab == 2 then tabRecipe()
     else                 tabAdvanced() end
+    navEnd()
 end
 
 local drawErrors = 0
 AddHook("ondraw", "ac_menu", function(dt)
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 440, 0, 4)
-    ImGui.Begin("Auto Crystal Combine")
+    beginWindow("Auto Crystal Combine", 600, 520)
     local widthPushed = ui("PushItemWidth", 220)
     returnButton()
 
@@ -3836,6 +4008,7 @@ AddHook("ondraw", "ac_menu", function(dt)
     end
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -5456,7 +5629,7 @@ local function drawBody()
         if bigButton(">  START CHARGER") then startRun() end
     else
         if bigButton("[]  STOP CHARGER",
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stopRun("stopped by user.")
         end
     end
@@ -5465,29 +5638,18 @@ local function drawBody()
         textColored(S.uiOk and C.green or C.red, S.uiMsg)
     end
 
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if     tab == 1 then tabMain()
     elseif tab == 2 then tabOptions()
     else                 tabTools() end
+    navEnd()
 end
 
 local drawErrors = 0
 AddHook("ondraw", "ach_menu", function(dt)
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 400, 0, 4)
-    ImGui.Begin("Auto Geiger Charger")
+    beginWindow("Auto Geiger Charger", 600, 520)
     local widthPushed = ui("PushItemWidth", 240)
     returnButton()
 
@@ -5500,6 +5662,7 @@ AddHook("ondraw", "ach_menu", function(dt)
     end
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -5811,13 +5974,13 @@ local function drawBody()
         if bigButton(">  START TAX") then startRun() end
     else
         if bigButton("[]  STOP TAX",
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stopRun("stopped by user.")
         end
     end
 
     section("CONFIG")
-    textColored(C.white, S.cfgPath or "taxuws_config.txt")
+    textColored(C.gray, S.cfgPath or "taxuws_config.txt")
     ui("SameLine", 170)
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
@@ -5829,27 +5992,16 @@ local function drawBody()
         textColored(S.uiOk and C.green or C.red, S.uiMsg)
     end
 
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if tab == 1 then tabStats() else tabSettings() end
+    navEnd()
 end
 
 local drawErrors = 0
 AddHook("ondraw", "taxuws_menu", function(dt)
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 400, 0, 4)
-    ImGui.Begin("Tax to UWS")
+    beginWindow("Tax to UWS", 600, 520)
     local widthPushed = ui("PushItemWidth", 220)
     returnButton()
 
@@ -5862,6 +6014,7 @@ AddHook("ondraw", "taxuws_menu", function(dt)
     end
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -6307,13 +6460,13 @@ local function drawBody()
         if bigButton(">  START " .. MODE_NAME[cfg.mode]) then startRun() end
     else
         if bigButton("[]  STOP " .. MODE_NAME[cfg.mode],
-            { 0.45, 0.12, 0.12, 1 }, { 0.60, 0.16, 0.16, 1 }, { 0.75, 0.20, 0.20, 1 }) then
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
             stopRun("stopped by user.")
         end
     end
 
     section("CONFIG")
-    textColored(C.white, S.cfgPath or "autodrop_config.txt")
+    textColored(C.gray, S.cfgPath or "autodrop_config.txt")
     ui("SameLine", 170)
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
@@ -6325,29 +6478,18 @@ local function drawBody()
         textColored(S.uiOk and C.green or C.red, S.uiMsg)
     end
 
-    ui("Spacing")
-    for i, name in ipairs(TABS) do
-        if i > 1 then ui("SameLine") end
-        if tab == i then
-            colorButton(" " .. name .. " ", 0, 0,
-                { 0.20, 0.20, 0.32, 1 }, { 0.24, 0.24, 0.38, 1 }, { 0.28, 0.28, 0.45, 1 })
-        else
-            if button(" " .. name .. " ", 0, 0) then tab = i end
-        end
-    end
-    ImGui.Separator()
-    ui("Spacing")
+    tab = navBegin(TABS, tab)
 
     if     tab == 1 then tabStats()
     elseif tab == 2 then tabItems()
     else                 tabAdvanced() end
+    navEnd()
 end
 
 local drawErrors = 0
 AddHook("ondraw", "autodrop_menu", function(dt)
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 440, 0, 4)
-    ImGui.Begin("Auto Drop / Trash")
+    beginWindow("Auto Drop / Trash", 600, 520)
     local widthPushed = ui("PushItemWidth", 200)
     returnButton()
 
@@ -6360,6 +6502,7 @@ AddHook("ondraw", "autodrop_menu", function(dt)
     end
 
     if widthPushed then ui("PopItemWidth") end
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)
@@ -7407,13 +7550,14 @@ do
 
     -- the toggle, drawn on the same row as the hotkey
     function AB.button()
-        local clicked
+        local n
         if state.on then
-            clicked = colorButton(" Auto Buff: ON ", 0, 0,
-                { 0.12, 0.35, 0.16, 1 }, { 0.16, 0.45, 0.20, 1 }, { 0.20, 0.55, 0.25, 1 })
+            n = pushBtn({ 0.14, 0.62, 0.34, 1 }, { 0.20, 0.74, 0.42, 1 }, { 0.10, 0.50, 0.27, 1 }, { 1, 1, 1, 1 })
         else
-            clicked = button(" Auto Buff: OFF ")
+            n = pushBtn({ 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }, { 1, 1, 1, 1 })
         end
+        local clicked = rawButton(" Auto Buff: " .. (state.on and "ON" or "OFF") .. " ")
+        popCols(n)
         if clicked then
             state.on, state.pending = not state.on, nil
             state.onAt, state.warnedNoLive, state.nextScan = os.clock(), false, 0
@@ -7449,27 +7593,27 @@ do
     end
 end
 
-local function drawHotkeySection()             -- one compact row
+local function drawHotkeySection()             -- compact, fits the side panel
     if HK.capturing then
         textColored(C.cyan, "Press a key... (Esc = cancel)")
-        ui("SameLine")
         if button(" Cancel ") then HK.capturing, HK.base = false, nil end
-        ui("Spacing")
         return
     end
-    textColored(C.white, "Hotkey")
+    textColored(C.gray, "Hide/show key")
     ui("SameLine")
     textColored(C.gold, HK.bk and HK.name:upper() or "/loader")
     if HK.bk then
-        ui("SameLine")
         if button(" Change ") then HK.capturing, HK.base = true, nil end
         ui("SameLine")
         if button(" Reset ") then setHotkey("Tab") saveHotkey() end
+        ui("SameLine")
     end
-    ui("SameLine")
     if button(" ? ") then dumpKeySupport() end      -- prints key support to the console
     ui("Spacing")
-    AB.button()                                     -- Auto Buff toggle, on its own line under the hotkey
+    ImGui.Separator()
+    ui("Spacing")
+    textColored(C.gray, "Auto Buff")
+    AB.button()
     ui("Spacing")
     AB.status()
 end
@@ -7555,21 +7699,40 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     if UI.hidden then return end
 
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 460, 0, 4)
-    ImGui.Begin("Ben Loader")
-
-    section("SELECT A SCRIPT")
-    drawHotkeySection()
-    textColored(C.gold, "SELECTED: " .. LOADER_OPTIONS[loader.selected].name)
-    ui("Spacing")
-    for i, opt in ipairs(LOADER_OPTIONS) do
-        local a, b = ImGui.RadioButton(opt.name, loader.selected == i)
-        if radioPicked(a, b) then loader.selected = i end
+    if loader.minimized then
+        beginWindow("Ben Loader Mini", 190, 0, 150, 46)
+        local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+        if sizedButton(" B ", 30, 30) then loader.minimized = false end
+        popCols(n)
+        ui("SameLine")
+        shinyText("Ben Loader", 1.1)
+        ImGui.End()
+        popTheme(nc, nv)
+        return
     end
+    beginWindow("Ben Loader", 580, 0, 520, 330)
+    drawHeader("Ben Loader", false, true)
+    if MINIMIZE_REQ then MINIMIZE_REQ = false; loader.minimized = true end
+
+    local LIST_H = #LOADER_OPTIONS * 34 + 16
+    local sOpen = beginChild("##scripts", 205, LIST_H, true)
+    section("SELECT A SCRIPT")
+    for i, opt in ipairs(LOADER_OPTIONS) do
+        if navItem(opt.name, loader.selected == i, -1, 28) then loader.selected = i end
+    end
+    if sOpen then ui("EndChild") end
+    ui("SameLine")
+    local tOpen = beginChild("##tools", 0, LIST_H, true)
+    section("HOTKEY & TOOLS")
+    drawHotkeySection()
+    if tOpen then ui("EndChild") end
 
     ui("Spacing")
-    ImGui.Separator()
-    if bigButton(">  LAUNCH SELECTED SCRIPT") then
+    -- launch button: green, so it is clearly different from the orange selection
+    local ln = pushBtn({ 0.14, 0.62, 0.34, 1 }, { 0.20, 0.74, 0.42, 1 }, { 0.10, 0.50, 0.27, 1 }, { 1, 1, 1, 1 })
+    local go = sizedButton(">  LAUNCH  " .. string.upper(LOADER_OPTIONS[loader.selected].name), -1, 40)
+    popCols(ln)
+    if go then
         local opt = LOADER_OPTIONS[loader.selected]
         local ok, err = launchScript(opt)
         if ok then
@@ -7581,6 +7744,7 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     end
     if loader.err then textColored(C.red, "Last error: " .. loader.err) end
 
+    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)

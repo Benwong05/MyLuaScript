@@ -6576,7 +6576,7 @@ do
             return true   -- don't send the command to the server
         end
 
-        if packet:find("action|wrench", 1, true) then grantWrench() end
+        if packet:find("action|wrench", 1, true) and not packet:find("|netid|", 1, true) then grantWrench() end   -- (a wrench on yourself, e.g. from Auto Buff, is not a telephone)
         if packet:find("action|wrench", 1, true) then
             BGL.wx = packet:match("|x|(%-?%d+)") or BGL.wx
             BGL.wy = packet:match("|y|(%-?%d+)") or BGL.wy
@@ -6984,6 +6984,471 @@ local function dumpKeySupport()                   -- prints what this executor o
     LogToConsole("`2[Ben Loader] `wGame-focus check: `9" .. tostring(focusApi()) .. " `w(nil = unknown, uses PowerShell fallback)")
 end
 
+---------------- AUTO BUFF -------------------------------
+-- Keeps two 30-minute buffs running by itself (always on, even while a script is
+-- launched or the menus are hidden):
+--     Songpyeon       -> "Lucky!"
+--     Arroz Con Pollo -> "Food: Breaking Gems"
+-- How it knows a buff is on / gone:
+--   * every time an item is really eaten (backpack count drops) the buff gets a
+--     30:00 timer; the timers are saved to benloader_buff.txt, so reloading the
+--     script does not make it eat again while the buff is still running
+--   * "worn off" game messages clear a buff at once, so it eats again right away
+--   * nothing is eaten while a buff is still active (30 min cooldown)
+-- Everything is non-blocking (a small state machine in the draw hook).
+local AB = {}
+do
+    local DURATION = 30 * 60
+    local PATHS = { "benloader_buff.txt", "scripts/benloader_buff.txt", "/sdcard/benloader_buff.txt" }
+    local state = {
+        on = false, pending = nil, nextCheck = 0, method = 1, cfgPath = nil,
+        buffs = {
+            { key = "lucky", title = "Lucky!",        match = "lucky",         item = "songpyeon",
+              pats = { "songpyeon", "lucky clover" }, items = "Songpyeon or Lucky Clover", method = 1, icon = 528, grace = 0,
+              exp = 0, live = 0, fails = 0, nextTry = 0, id = nil, missing = false },
+            { key = "food",  title = "Breaking Gems", match = "breaking gems", item = "arroz con pollo",
+              pats = { "arroz con pollo", "arroz" }, items = "Arroz Con Pollo", method = 1, icon = 4604, grace = 0,
+              exp = 0, live = 0, fails = 0, nextTry = 0, id = nil, missing = false },
+        },
+        nextScan = 0, liveAny = 0, onAt = 0, warnedNoLive = false, lastSave = 0,
+        profileAt = 0, profFails = 0, profileFailed = false, awaiting = nil, nextProfile = 0, hideUntil = 0,
+    }
+
+    local function blog(m) LogToConsole("`2[Auto Buff] `w" .. tostring(m)) end
+
+    ------------- save / load -------------
+    local function save()
+        local data = "on=" .. (state.on and "1" or "0") .. "\nmethod=" .. state.method .. "\n"
+        for _, b in ipairs(state.buffs) do data = data .. b.key .. "_e=" .. math.floor(b.exp) .. "\n" end
+        local order = {}
+        if state.cfgPath then order[1] = state.cfgPath end
+        for _, p in ipairs(PATHS) do order[#order + 1] = p end
+        for _, p in ipairs(order) do
+            local ok, f = pcall(io.open, p, "w")
+            if ok and f and pcall(function() f:write(data) f:close() end) then
+                state.cfgPath = p
+                return true
+            end
+        end
+        return false
+    end
+
+    function AB.load()
+        for _, p in ipairs(PATHS) do
+            local ok, f = pcall(io.open, p, "r")
+            if ok and f then
+                local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+                if rok and data and data ~= "" then
+                    local now = os.time()
+                    -- timers are stored as "<key>_e=" (set by a real eat). Old "<key>=" lines
+                    -- (from the removed Mark button) no longer match, so they are dropped.
+                    for k, v in data:gmatch("([%w_]+)=(%d+)") do
+                        v = tonumber(v) or 0
+                        if k == "on" then state.on = (v == 1)
+                        else
+                            for _, b in ipairs(state.buffs) do
+                                if k == b.key .. "_e" and v > now then b.exp = v end   -- keep only timers still running
+                            end
+                        end
+                    end
+                    state.cfgPath = p
+                    if state.on then blog("Auto Buff ON (restored from last session).") end
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    ------------- inventory -------------
+    local nameCache = {}
+    local function itemName(id)
+        local v = nameCache[id]
+        if v ~= nil then return v end
+        v = ""
+        for _, fn in ipairs({ "GetItemInfoByID", "GetItemByIDSafe", "GetItemInfo" }) do
+            local f = _G[fn]
+            if type(f) == "function" then
+                local ok, info = pcall(f, id)
+                if ok and info then
+                    local okn, n = pcall(function() return info.name end)
+                    if okn and type(n) == "string" and n ~= "" then v = n:lower() break end
+                end
+            end
+        end
+        nameCache[id] = v
+        return v
+    end
+
+    -- returns id, amount  |  nil, 0 = not in backpack  |  nil, nil = backpack unreadable
+    -- b.pats is a PRIORITY list: the first name you own wins (e.g. Songpyeon before Lucky Clover).
+    -- returns id, amount, name  |  nil, 0 = none in backpack  |  nil, nil = backpack unreadable
+    local function findItem(b)
+        local ok, inv = pcall(GetInventory)
+        if not ok or type(inv) ~= "table" then return nil, nil end
+        for _, pat in ipairs(b.pats) do
+            local found, amt
+            pcall(function()
+                for _, it in pairs(inv) do
+                    local id, n = it.id, it.amount or 0
+                    if id and n > 0 then
+                        local nm = itemName(id)
+                        -- seeds / blocks named like the food are not food
+                        if nm:find(pat, 1, true) and not nm:find("seed", 1, true) then
+                            found, amt = id, n
+                            break
+                        end
+                    end
+                end
+            end)
+            if found then return found, amt, pat end
+        end
+        return nil, 0
+    end
+
+    local function countOf(id)
+        local ok, n = pcall(function()
+            for _, it in pairs(GetInventory()) do
+                if it.id == id then return it.amount end
+            end
+            return 0
+        end)
+        if ok and type(n) == "number" then return n end
+        return nil
+    end
+
+    ------------- eating -------------
+    -- method 1 = tile packet on your own tile, method 2 = "wear" packet. A try only counts when the
+    -- backpack count really drops; the method that worked is remembered.
+    local function sendConsume(method, id)
+        if method == 2 then
+            SendPacket(2, "action|wear\n|itemID|" .. id)
+            return
+        end
+        local p = GetLocal().pos
+        local tx, ty = math.floor(p.x / 32), math.floor(p.y / 32)
+        SendPacketRaw(false, {
+            type = 3, value = id, px = tx, py = ty,
+            x = p.x, y = p.y, xspeed = 0, yspeed = 0,
+            netid = 0, snetid = 0, state = 0,
+        })
+        if method == 3 then                                       -- same, followed by the state packet like a real place
+            SendPacketRaw(false, {
+                type = 0, value = id, px = tx, py = ty,
+                x = p.x, y = p.y, xspeed = 0, yspeed = 0,
+                netid = 0, snetid = 0, state = 3104,
+            })
+        end
+    end
+
+    ------------- reading the real effect timers -------------
+    -- The game lists effects as  "Lucky! (28 mins, 26 secs left)". Any text the game sends (or any
+    -- text/table field the executor exposes on your player) that looks like that is parsed, and the
+    -- buff's timer is set to the REAL time left. This is what the eat / don't-eat decision uses.
+    local function readStatus(text)
+        local low = (tostring(text or ""):gsub("`.", "")):lower()
+        if not low:find("left", 1, true) then return false end
+        local got, now = false, os.time()
+        for name, inner in low:gmatch("([^\n%(]+)%(([^%)]*left)%)") do
+            local h = tonumber(inner:match("(%d+)%s*hour")) or 0
+            local m = tonumber(inner:match("(%d+)%s*min")) or 0
+            local s = tonumber(inner:match("(%d+)%s*sec")) or 0
+            local rem = h * 3600 + m * 60 + s
+            if rem > 0 then
+                for _, b in ipairs(state.buffs) do
+                    if name:find(b.match, 1, true) then
+                        b.exp, b.live, got = now + rem, now, true
+                    end
+                end
+            end
+        end
+        if got then
+            state.liveAny = now
+            if now - state.lastSave >= 20 then state.lastSave = now; save() end
+        end
+        return got
+    end
+
+    local function scanLocal()
+        local seen, n = {}, 0
+        local function walk(t, depth)
+            if type(t) == "string" then readStatus(t) return end
+            if n > 600 then return end
+            pcall(function()
+                for _, v in pairs(t) do
+                    n = n + 1
+                    if type(v) == "string" then
+                        if v:find("left", 1, true) then readStatus(v) end
+                    elseif type(v) == "table" and depth < 3 and not seen[v] then
+                        seen[v] = true
+                        walk(v, depth + 1)
+                    end
+                end
+            end)
+        end
+        local okL, me = pcall(GetLocal)
+        if okL and me ~= nil then walk(me, 0) end
+        for _, fn in ipairs({ "GetBuffs", "GetEffects", "GetStatusEffects", "GetMods", "GetPlayerBuffs" }) do
+            local f = _G[fn]
+            if type(f) == "function" then
+                local ok, r = pcall(f)
+                if ok and r ~= nil then walk(r, 0) end
+            end
+        end
+    end
+
+    ------------- reading your own profile ("Active effects:") -------------
+    -- Wrenching yourself opens a dialog that lists every active effect with its time left, e.g.
+    --   add_label_with_icon|small|`wLucky!`` (27 mins, 5 secs left)``|left|528|
+    -- Auto Buff sends that wrench itself, hides the dialog, and reads the list. An effect that is
+    -- not in the list is OFF. This is the real status, so it decides whether to eat.
+    local function parseProfile(dialog)
+        local low = dialog:lower()
+        local at = low:find("active effects", 1, true)
+        if not at then return false end
+        local section = dialog:sub(at)
+        local stop = section:find("add_spacer", 1, true)
+        if stop then section = section:sub(1, stop - 1) end
+
+        local now = os.time()
+        local found = {}
+        for text, icon in section:gmatch("add_label_with_icon|[^|\n]*|([^|\n]*)|left|(%d+)|") do
+            local t = (text:gsub("`.", "")):lower()
+            local h = tonumber(t:match("(%d+)%s*hour")) or 0
+            local m = tonumber(t:match("(%d+)%s*min")) or 0
+            local s = tonumber(t:match("(%d+)%s*sec")) or 0
+            local rem = h * 3600 + m * 60 + s
+            for _, b in ipairs(state.buffs) do
+                if tonumber(icon) == b.icon or t:find(b.match, 1, true) then found[b] = rem end
+            end
+        end
+        for _, b in ipairs(state.buffs) do
+            local rem = found[b]
+            if rem == nil then
+                if now >= b.grace then b.exp, b.nextTry = 0, 0 end   -- not listed = not active (grace: just eaten)
+            else
+                b.exp = now + (rem > 0 and rem or 60)
+            end
+            b.live = now
+        end
+        state.profileAt, state.liveAny = now, now
+        state.profFails, state.profileFailed, state.awaiting = 0, false, nil
+        save()
+        return true
+    end
+
+    local function requestProfile(clock)
+        local ok, id = pcall(function() return GetLocal().netid end)
+        if not ok or type(id) ~= "number" then return false end
+        state.awaiting = { at = clock }
+        state.hideUntil = clock + 3                                   -- hide the profile dialog we asked for
+        state.nextProfile = clock + 60
+        SendPacket(2, "action|wrench\n|netid|" .. math.floor(id) .. "\n")
+        return true
+    end
+
+    function AB.tick()
+        if not state.on then return end
+        local now, clock = os.time(), os.clock()
+
+        -- waiting to see whether the last item was really eaten
+        local p = state.pending
+        if p then
+            local cnt = countOf(p.id)
+            if cnt ~= nil and cnt < p.before then
+                p.b.exp, p.b.fails, p.b.missing = now + DURATION + 2, 0, false
+                p.b.method = p.method                            -- remember what worked for THIS item
+                state.pending = nil
+                state.eatGap = clock + 4                         -- let the game finish before the next item
+                p.b.grace = now + 20                             -- give the effect list time to show it
+                state.nextProfile = clock + 6                    -- then read the real time left
+                save()
+                blog("Ate " .. (p.name or p.b.item) .. " (packet " .. p.method .. ") - active for 30 min.")
+            elseif clock - p.at >= 3.5 then
+                state.pending = nil
+                p.b.fails = p.b.fails + 1
+                blog("Eating " .. (p.name or p.b.item) .. " with packet " .. p.method .. ": nothing changed (id " .. p.id
+                    .. ", count " .. tostring(countOf(p.id)) .. ")"
+                    .. (state.lastMsg and ("; game said: " .. state.lastMsg) or "") .. ".")
+                p.b.method = (p.method % 3) + 1                  -- try the next packet type for this item
+                if p.b.fails >= 6 then
+                    p.b.fails, p.b.nextTry = 0, clock + 30
+                    blog("Could not eat " .. (p.name or p.b.item) .. " with any packet. Trying again in 30s.")
+                else
+                    p.b.nextTry = clock + 2
+                end
+            end
+            return
+        end
+
+        if clock < (state.eatGap or 0) then return end
+        if clock < state.nextCheck then return end
+        state.nextCheck = clock + 1
+        local okL, me = pcall(GetLocal)
+        if not okL or not me then return end                      -- not in a world right now
+
+        -- profile read: did the dialog we asked for arrive?
+        if state.awaiting and clock - state.awaiting.at > 3 then
+            state.awaiting = nil
+            state.profFails = state.profFails + 1
+            if state.profFails >= 3 and not state.profileFailed then
+                state.profileFailed = true
+                blog("Can't read your profile effects - using eat timers + 'worn off' messages instead.")
+            end
+        end
+        -- regular check of the real status (faster when a buff is about to run out)
+        if not state.awaiting and clock >= state.nextProfile then
+            local soon = false
+            for _, b in ipairs(state.buffs) do
+                if b.exp > now and b.exp - now <= 60 then soon = true end
+            end
+            if not requestProfile(clock) then
+                state.profFails = state.profFails + 1
+                if state.profFails >= 3 then state.profileFailed = true end
+                state.nextProfile = clock + 15
+            elseif soon then
+                state.nextProfile = clock + 10
+            end
+        end
+        local fresh = state.profileFailed or (now - state.profileAt <= 12)
+
+        for _, b in ipairs(state.buffs) do
+            if b.exp <= now and clock >= b.nextTry then           -- buff looks off: find food, confirm, eat
+                local id, amt, which = findItem(b)                -- first item of the priority list you own
+                if id == nil and amt == nil then
+                    b.nextTry = clock + 10                        -- backpack unreadable
+                elseif not id then
+                    if not b.missing then
+                        b.missing = true
+                        blog("No " .. b.items .. " in your backpack - checking again every few seconds.")
+                    end
+                    b.nextTry = clock + 4                         -- keep searching until one shows up
+                else
+                    if b.missing then
+                        b.missing = false
+                        blog("Found " .. which .. " in your backpack.")
+                    end
+                    if not fresh then
+                        if not state.awaiting and not requestProfile(clock) then
+                            state.profFails = state.profFails + 1
+                            if state.profFails >= 3 then state.profileFailed = true end
+                        end
+                        return                                    -- wait for the real status first
+                    end
+                    state.lastMsg = nil
+                    if pcall(sendConsume, b.method, id) then
+                        state.pending = { b = b, id = id, before = amt, at = clock, method = b.method, name = which }
+                        return                                    -- one item at a time
+                    end
+                    b.nextTry = clock + 5
+                end
+            end
+        end
+    end
+
+    ------------- game messages -------------
+    local function onText(txt)
+        if readStatus(txt) then return end                        -- real "x mins left" text from the game
+        local low = (tostring(txt or ""):gsub("`.", "")):lower()
+        if low == "" then return end
+        if state.pending then state.lastMsg = low:sub(1, 90) end   -- what the game answered to the last try
+        local now = os.time()
+        local lucky, food = state.buffs[1], state.buffs[2]
+
+        if low:find("luckier than before", 1, true) then          -- Songpyeon eaten (also by hand)
+            lucky.exp = now + DURATION + 2
+            save()
+            return
+        end
+        if low:find("worn off", 1, true) or low:find("wore off", 1, true) or low:find("has expired", 1, true) then
+            if low:find("luck", 1, true) then
+                lucky.exp, lucky.nextTry = 0, 0
+                save()
+            elseif low:find("food", 1, true) or low:find("breaking", 1, true) or low:find("gem", 1, true) then
+                food.exp, food.nextTry = 0, 0
+                save()
+            end
+        end
+    end
+
+    local function onVariant(var)
+        local ok, name = pcall(function() return tostring(var[0] or "") end)
+        if not ok then return false end
+        if name == "OnConsoleMessage" or name == "OnTextOverlay" then
+            pcall(function() onText(var[1]) end)
+        elseif name == "OnTalkBubble" then
+            pcall(function() onText(var[2]) end)
+        elseif name == "OnDialogRequest" and state.on then
+            -- your profile (also read when you wrench yourself by hand). Hidden only when Auto Buff asked
+            -- for it; both hooks give the same answer so the executor keeps it hidden.
+            local okd, parsed = pcall(function()
+                local d = tostring(var[1] or "")
+                return parseProfile(d)
+            end)
+            if okd and parsed and os.clock() <= (state.hideUntil or 0) then return true end
+        elseif state.on then
+            pcall(function()
+                for i = 1, 4 do
+                    local v = var[i]
+                    if type(v) == "string" and v:find("left", 1, true) then readStatus(v) end
+                end
+            end)
+        end
+        return false
+    end
+    pcall(AddHook, "onvariant", "benloader_buff_v1", onVariant)
+    pcall(AddHook, "OnVariant", "benloader_buff_v2", onVariant)
+
+    ------------- menu -------------
+    local function mmss(s)
+        s = math.max(0, math.floor(s))
+        return string.format("%d:%02d", s // 60, s % 60)
+    end
+
+    -- the toggle, drawn on the same row as the hotkey
+    function AB.button()
+        local clicked
+        if state.on then
+            clicked = colorButton(" Auto Buff: ON ", 0, 0,
+                { 0.12, 0.35, 0.16, 1 }, { 0.16, 0.45, 0.20, 1 }, { 0.20, 0.55, 0.25, 1 })
+        else
+            clicked = button(" Auto Buff: OFF ")
+        end
+        if clicked then
+            state.on, state.pending = not state.on, nil
+            state.onAt, state.warnedNoLive, state.nextScan = os.clock(), false, 0
+            state.profileAt, state.profFails, state.profileFailed, state.awaiting, state.nextProfile = 0, 0, false, nil, 0
+            for _, b in ipairs(state.buffs) do b.exp, b.grace = 0, 0 end    -- start from the real status, not old timers
+            for _, b in ipairs(state.buffs) do b.nextTry, b.fails, b.missing = 0, 0, false end
+            save()
+            blog(state.on and "ON - eats Songpyeon + Arroz Con Pollo whenever the buffs are off."
+                or "OFF.")
+        end
+    end
+
+    -- timers, shown under the hotkey row while it is ON
+    function AB.status()
+        if not state.on then return end
+        local now = os.time()
+        for _, b in ipairs(state.buffs) do
+            local left, txt, col = b.exp - now, nil, nil
+            if state.pending and state.pending.b == b then txt, col = "eating...", C.cyan
+            elseif state.profileAt == 0 and not state.profileFailed and left <= 0 then txt, col = "checking status...", C.cyan
+            elseif left > 0 then txt, col = mmss(left) .. " left", C.green
+            elseif b.missing then txt, col = "no item in backpack", C.red
+            else txt, col = "off - eating soon", C.yellow end
+            textColored(C.white, b.title)
+            ui("SameLine", 150)                                   -- timer column (clear of the label)
+            textColored(col, txt)
+            if left > 0 and not (state.pending and state.pending.b == b) then
+                ui("SameLine")
+                textColored(C.gray, (state.profileAt > 0 and now - state.profileAt <= 130) and "live" or "est.")
+            end
+        end
+        ui("Spacing")
+    end
+end
+
 local function drawHotkeySection()             -- one compact row
     if HK.capturing then
         textColored(C.cyan, "Press a key... (Esc = cancel)")
@@ -7004,10 +7469,14 @@ local function drawHotkeySection()             -- one compact row
     ui("SameLine")
     if button(" ? ") then dumpKeySupport() end      -- prints key support to the console
     ui("Spacing")
+    AB.button()                                     -- Auto Buff toggle, on its own line under the hotkey
+    ui("Spacing")
+    AB.status()
 end
 
 loadHotkey()
 if HK.spec == nil then setHotkey("Tab") end
+AB.load()                                         -- restore Auto Buff on/off + running timers
 
 -- While a script is being launched, AddHook is swapped for a tracking wrapper:
 -- every hook it registers gets a unique name, is remembered, and is gated by
@@ -7071,6 +7540,7 @@ end
 
 AddHook("ondraw", "script_loader_menu", function(dt)
     pcall(hotkeyTick)
+    pcall(AB.tick)                                -- Auto Buff keeps running with a script launched / menus hidden
     if loader.launched then
         -- A script is running: only its own window shows, until it asks to Return.
         if not ACTIVE.returnReq then return end
@@ -7085,7 +7555,7 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     if UI.hidden then return end
 
     local nc, nv = pushTheme()
-    ui("SetNextWindowSize", 360, 0, 4)
+    ui("SetNextWindowSize", 460, 0, 4)
     ImGui.Begin("Ben Loader")
 
     section("SELECT A SCRIPT")

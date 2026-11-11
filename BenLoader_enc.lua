@@ -15,6 +15,8 @@
 local FANCY_UI = true
 -- true = show the normal window title bar, false = custom header (logo + title + Return)
 local SHOW_TITLEBAR = false
+-- Overall size of every window / button / text. 1.0 = old size, 0.8 = smaller (default). Try 0.7 for even smaller.
+local UI_SCALE = 0.8
 
 ---------------- PALETTE ------------------------------
 local ACC        = { 0.93, 0.40, 0.08, 1 }    -- main orange
@@ -138,6 +140,13 @@ local THEME_VARS = {                           -- numbers or { x, y }
     { "ItemInnerSpacing",  { 6, 6 } },
 }
 
+for _, e in ipairs(THEME_VARS) do                 -- shrink padding / spacing / rounding with UI_SCALE
+    if e[1] ~= "WindowBorderSize" and e[1] ~= "ChildBorderSize" and e[1] ~= "FrameBorderSize" then
+        if type(e[2]) == "table" then e[2] = { e[2][1] * UI_SCALE, e[2][2] * UI_SCALE }
+        else e[2] = e[2] * UI_SCALE end
+    end
+end
+
 -- Pushes one colour using the given signature. Returns true if the call worked.
 local function tryPush(mode, idx, c)
     if mode == "vec4" then
@@ -246,6 +255,8 @@ end
 -- plain button with optional size (w, h); falls back to a plain button.
 local function rawButton(label, w, h)
     if FANCY_UI and w then
+        if w > 0 then w = w * UI_SCALE end
+        if h and h > 0 then h = h * UI_SCALE end
         local ok, r = pcall(ImGui.Button, label, w, h or 0)
         if ok then return r end
     end
@@ -282,7 +293,9 @@ end
 -- Button with a real size (ImVec2). Falls back to the normal button.
 local function sizedButton(label, w, h)
     if FANCY_UI and type(ImVec2) == "function" then
-        local ok, r = pcall(ImGui.Button, label, ImVec2(w, h))
+        local sw = (w > 0) and w * UI_SCALE or w
+        local sh = (h > 0) and h * UI_SCALE or h
+        local ok, r = pcall(ImGui.Button, label, ImVec2(sw, sh))
         if ok then return r end
     end
     return rawButton(label, w, h)
@@ -297,10 +310,27 @@ local function bigButton(label, base, hover, active)
 end
 
 -- "Label            value" with the value in an aligned column.
-local VAL_X = 150                             -- x position of the value column
+local VAL_X = 150 * UI_SCALE                             -- minimum x of the value column
+local valCol = VAL_X                                     -- grows to fit the widest label seen, so rows stay aligned
 local function rowv(label, value, valueColor)
     textColored(C.gray, label)
-    ui("SameLine", VAL_X)
+    -- width of the label: measured if ImGui can do it, otherwise estimated from the character count
+    -- (the estimate is always used as a minimum, so the value can never land on top of the label)
+    local w = 0
+    local okW, mw = ui("CalcTextSize", label)
+    if okW then
+        if type(mw) ~= "number" then
+            local okx, x = pcall(function() return mw.x end)
+            mw = okx and x or nil
+        end
+        if type(mw) == "number" then w = mw end
+    end
+    local est = #label * 7.6 * UI_SCALE / 0.8
+    if est > w then w = est end
+    local okc, cx = ui("GetCursorPosX")
+    local need = (okc and type(cx) == "number" and cx or 0) + w + 14 * UI_SCALE
+    if need > valCol then valCol = need end
+    ui("SameLine", valCol)
     textColored(valueColor or C.white, value)
 end
 
@@ -334,20 +364,27 @@ local beginMode = nil                         -- "flags" | "plain"
 -- Opens the window. Custom look = no title bar (header is drawn by drawHeader).
 -- Always finish with ImGui.End().
 local MIN_W, MIN_H = 430, 300                   -- window can't be resized smaller than this (tiny windows crashed ImGui)
-local function beginWindow(title, w, h, minW, minH)
+local FONT_SET = false
+local function beginWindow(title, w, h, minW, minH, mini)
     CUR_TITLE = title
-    minW, minH = minW or MIN_W, minH or MIN_H
-    ui("SetNextWindowSize", w or 560, h or 0, 4)      -- first-use size, you can still resize
+    minW, minH = (minW or MIN_W) * UI_SCALE, (minH or MIN_H) * UI_SCALE
+    ui("SetNextWindowSize", (w or 560) * UI_SCALE, (h or 0) * UI_SCALE, 4)      -- first-use size, you can still resize
     if FANCY_UI and type(ImVec2) == "function" then
         local done = pcall(ImGui.SetNextWindowSizeConstraints, ImVec2(minW, minH), ImVec2(4000, 4000))
         if not done then pcall(ImGui.SetNextWindowSizeConstraints, minW, minH, 4000, 4000) end
     end
     if FANCY_UI and not SHOW_TITLEBAR and beginMode ~= "plain" then
         -- 33 = NoTitleBar (1) + NoCollapse (32)
-        if pcall(ImGui.Begin, title, true, 33) then beginMode = "flags" return end
+        -- mini bars: also AlwaysAutoResize (64) + NoScrollbar (8) + NoScrollWithMouse (16)
+        if pcall(ImGui.Begin, title, true, mini and 121 or 33) then
+            beginMode = "flags"
+            ui("SetWindowFontScale", UI_SCALE)
+            return
+        end
         beginMode = "plain"
     end
     ImGui.Begin(title)
+    ui("SetWindowFontScale", UI_SCALE)
 end
 
 -- Animated rainbow text with a moving white "shine" sweeping across it.
@@ -364,7 +401,7 @@ local function shinyText(text, scale)
     local t = os.clock()
     local n = #text
     local shinePos = (t * 8) % (n + 8) - 4              -- travelling highlight
-    ui("SetWindowFontScale", scale or 1.0)
+    ui("SetWindowFontScale", (scale or 1.0) * UI_SCALE)
     for i = 1, n do
         local ch = text:sub(i, i)
         local h = (i * 0.045 + t * 0.25) % 1
@@ -374,11 +411,12 @@ local function shinyText(text, scale)
         textColored({ r, g, b, 1 }, ch)
         if i < n then ui("SameLine", 0, 0) end
     end
-    ui("SetWindowFontScale", 1.0)
+    ui("SetWindowFontScale", UI_SCALE)
 end
 
 -- Logo tile + title on the left, "< Return" on the right.
 local MINIMIZE_REQ = false
+local SCRIPT_MIN_REQ = false                    -- set by the "_" button in a launched script window
 local function drawHeader(title, withReturn, withMin)
     local ww = 0
     local okw, w = pcall(ImGui.GetWindowWidth)
@@ -399,12 +437,16 @@ local function drawHeader(title, withReturn, withMin)
     end
 
     if withReturn then
-        ui("SameLine", math.max(160, ww - 118))
+        ui("SameLine", math.max(160 * UI_SCALE, ww - 160 * UI_SCALE))
         if type(y) == "number" then ui("SetCursorPosY", y + 2) end
         if sizedButton("<  Return", 96, 30) then ACTIVE.returnReq = true end
+        -- minimize button for the launched script's window
+        ui("SameLine", math.max(160 * UI_SCALE, ww - 52 * UI_SCALE))
+        if type(y) == "number" then ui("SetCursorPosY", y + 2) end
+        if sizedButton(" _ ", 34, 30) then SCRIPT_MIN_REQ = true end
     end
     if withMin then
-        ui("SameLine", math.max(160, ww - 52))
+        ui("SameLine", math.max(160 * UI_SCALE, ww - 52 * UI_SCALE))
         if type(y) == "number" then ui("SetCursorPosY", y + 2) end
         if sizedButton(" _ ", 34, 30) then MINIMIZE_REQ = true end
     end
@@ -437,6 +479,8 @@ local function beginChild(id, w, h, border)
     if not FANCY_UI or type(ImVec2) ~= "function" or type(ImGui.BeginChild) ~= "function" then
         return false
     end
+    if w > 0 then w = w * UI_SCALE end
+    if h > 0 then h = h * UI_SCALE end
     return (pcall(ImGui.BeginChild, id, ImVec2(w, h), border and true or false))
 end
 
@@ -1331,7 +1375,7 @@ AddHook("ondraw", "autosb_menu", function(dt)
     local nc, nv = pushTheme()
 
     beginWindow("Auto SB - PoliceMan v4", 600, 520)
-    local widthPushed = ui("PushItemWidth", 240)
+    local widthPushed = ui("PushItemWidth", 240 * UI_SCALE)
     returnButton()
 
     ------------- START / STOP (full width) -------------
@@ -1348,7 +1392,7 @@ AddHook("ondraw", "autosb_menu", function(dt)
     ------------- CONFIG -------------------
     section("CONFIG")
     textColored(C.gray, S.cfgPath or "autosb_config.txt")
-    ui("SameLine", 170)
+    ui("SameLine")
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
     if button(" Load ", 70, 0) then loadConfig() end
@@ -3337,7 +3381,7 @@ local function drawBody()
     ------------- CONFIG -------------------
     section("CONFIG")
     textColored(C.gray, S.cfgPath or "autogeiger_config.txt")
-    ui("SameLine", 170)
+    ui("SameLine")
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
     if button(" Load ", 70, 0) then loadConfig() end
@@ -3379,7 +3423,7 @@ AddHook("ondraw", "gwk_menu", function(dt)
 
     local nc, nv = pushTheme()
     beginWindow("Auto Geiger", 600, 520)
-    local widthPushed = ui("PushItemWidth", 240)
+    local widthPushed = ui("PushItemWidth", 240 * UI_SCALE)
     returnButton()
 
     if drawErrors < 3 then
@@ -3973,7 +4017,7 @@ local function drawBody()
 
     section("CONFIG")
     textColored(C.gray, S.cfgPath or "autocrystal_config.txt")
-    ui("SameLine", 170)
+    ui("SameLine")
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
     if button(" Load ", 70, 0) then loadConfig() end
@@ -5650,7 +5694,7 @@ local drawErrors = 0
 AddHook("ondraw", "ach_menu", function(dt)
     local nc, nv = pushTheme()
     beginWindow("Auto Geiger Charger", 600, 520)
-    local widthPushed = ui("PushItemWidth", 240)
+    local widthPushed = ui("PushItemWidth", 240 * UI_SCALE)
     returnButton()
 
     if drawErrors < 3 then
@@ -5981,7 +6025,7 @@ local function drawBody()
 
     section("CONFIG")
     textColored(C.gray, S.cfgPath or "taxuws_config.txt")
-    ui("SameLine", 170)
+    ui("SameLine")
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
     if button(" Load ", 70, 0) then loadConfig() end
@@ -6401,7 +6445,7 @@ local function tabItems()
     for i, r in ipairs(rules) do
         local have = getItemCount(r.id)
         textColored(C.white, itemName(r.id))
-        ui("SameLine", 250)
+        ui("SameLine", math.max(250 * UI_SCALE, 120))
         textColored(C.gray, "have " .. tostring(have or "?"))
         local _, v = ImGui.InputInt("at##at" .. r.id, r.at)
         if v then r.at = clampAt(v) end
@@ -6429,7 +6473,7 @@ local function tabItems()
                 break
             end
             textColored(C.white, e.name .. "  x" .. e.amount)
-            ui("SameLine", 290)
+            ui("SameLine", math.max(290 * UI_SCALE, 140))
             if button(" Add ##add" .. e.id) then addRule(e.id, cfg.newAt) end
         end
     end
@@ -6467,7 +6511,7 @@ local function drawBody()
 
     section("CONFIG")
     textColored(C.gray, S.cfgPath or "autodrop_config.txt")
-    ui("SameLine", 170)
+    ui("SameLine")
     if button(" Save ", 70, 0) then saveConfig() end
     ui("SameLine")
     if button(" Load ", 70, 0) then loadConfig() end
@@ -7261,21 +7305,38 @@ do
     end
 
     ------------- eating -------------
-    -- method 1 = tile packet on your own tile, method 2 = "wear" packet. A try only counts when the
-    -- backpack count really drops; the method that worked is remembered.
+    -- Eat attempts. Each attempt = { kind, dx, dy } : kind "tile" sends the use packet at
+    -- (your tile + dx, + dy), kind "wear" sends the wear packet. A player standing between two
+    -- tiles (x or y) is not "on" a single tile, so we try: the rounded tile, the 2 tiles you
+    -- straddle (left/right, up/down), then the 4 neighbours (up/down/left/right), then wear.
+    -- A try only counts when the backpack count really drops; the attempt that worked goes first.
+    local ATTEMPTS = {
+        { "tile", 0, 0 },     -- own tile (rounded to the nearest tile)
+        { "tile", -1, 0 },    -- between 2 tiles sideways: left one
+        { "tile", 1, 0 },     -- ... right one
+        { "tile", 0, -1 },    -- between 2 tiles up/down: upper one
+        { "tile", 0, 1 },     -- ... lower one
+        { "wear" },           -- wear packet
+        { "tile", 0, 0, true },  -- own tile + state packet like a real place
+    }
+    local NATT = #ATTEMPTS
+
     local function sendConsume(method, id)
-        if method == 2 then
+        local a = ATTEMPTS[method] or ATTEMPTS[1]
+        if a[1] == "wear" then
             SendPacket(2, "action|wear\n|itemID|" .. id)
             return
         end
         local p = GetLocal().pos
-        local tx, ty = math.floor(p.x / 32), math.floor(p.y / 32)
+        -- sprite position -> tile: +10 / +15 centres the check on the body (not the top-left corner)
+        local tx = math.floor((p.x + 10) / 32) + a[2]
+        local ty = math.floor((p.y + 15) / 32) + a[3]
         SendPacketRaw(false, {
             type = 3, value = id, px = tx, py = ty,
             x = p.x, y = p.y, xspeed = 0, yspeed = 0,
             netid = 0, snetid = 0, state = 0,
         })
-        if method == 3 then                                       -- same, followed by the state packet like a real place
+        if a[4] then
             SendPacketRaw(false, {
                 type = 0, value = id, px = tx, py = ty,
                 x = p.x, y = p.y, xspeed = 0, yspeed = 0,
@@ -7402,23 +7463,23 @@ do
                 p.b.exp, p.b.fails, p.b.missing = now + DURATION + 2, 0, false
                 p.b.method = p.method                            -- remember what worked for THIS item
                 state.pending = nil
-                state.eatGap = clock + 4                         -- let the game finish before the next item
+                state.eatGap = clock + 1.2                       -- short gap before the next item
                 p.b.grace = now + 20                             -- give the effect list time to show it
                 state.nextProfile = clock + 6                    -- then read the real time left
                 save()
-                blog("Ate " .. (p.name or p.b.item) .. " (packet " .. p.method .. ") - active for 30 min.")
-            elseif clock - p.at >= 3.5 then
+                blog("Ate " .. (p.name or p.b.item) .. " (attempt " .. p.method .. "/" .. NATT .. ") - active for 30 min.")
+            elseif clock - p.at >= 1.1 then
                 state.pending = nil
                 p.b.fails = p.b.fails + 1
-                blog("Eating " .. (p.name or p.b.item) .. " with packet " .. p.method .. ": nothing changed (id " .. p.id
+                blog("Eating " .. (p.name or p.b.item) .. " attempt " .. p.method .. "/" .. NATT .. ": nothing changed (id " .. p.id
                     .. ", count " .. tostring(countOf(p.id)) .. ")"
                     .. (state.lastMsg and ("; game said: " .. state.lastMsg) or "") .. ".")
-                p.b.method = (p.method % 3) + 1                  -- try the next packet type for this item
-                if p.b.fails >= 6 then
-                    p.b.fails, p.b.nextTry = 0, clock + 30
-                    blog("Could not eat " .. (p.name or p.b.item) .. " with any packet. Trying again in 30s.")
+                p.b.method = (p.method % NATT) + 1               -- next attempt (other tile / neighbour / wear)
+                if p.b.fails >= NATT * 2 then                    -- every attempt tried twice
+                    p.b.fails, p.b.nextTry = 0, clock + 8
+                    blog("Could not eat " .. (p.name or p.b.item) .. " with any attempt. Trying again in 8s.")
                 else
-                    p.b.nextTry = clock + 2
+                    p.b.nextTry = clock + 0.15               -- retry right away with the next attempt
                 end
             end
             return
@@ -7426,7 +7487,7 @@ do
 
         if clock < (state.eatGap or 0) then return end
         if clock < state.nextCheck then return end
-        state.nextCheck = clock + 1
+        state.nextCheck = clock + 0.4
         local okL, me = pcall(GetLocal)
         if not okL or not me then return end                      -- not in a world right now
 
@@ -7582,7 +7643,7 @@ do
             elseif b.missing then txt, col = "no item in backpack", C.red
             else txt, col = "off - eating soon", C.yellow end
             textColored(C.white, b.title)
-            ui("SameLine", 150)                                   -- timer column (clear of the label)
+            ui("SameLine", math.max(VAL_X, 150 * UI_SCALE))
             textColored(col, txt)
             if left > 0 and not (state.pending and state.pending.b == b) then
                 ui("SameLine")
@@ -7647,6 +7708,7 @@ local function launchScript(opt)
     local gate = { alive = true, hooks = {} }
     loader.gate = gate
     ACTIVE.stop, ACTIVE.returnReq = nil, false
+    loader.scriptMin, SCRIPT_MIN_REQ = false, false
     local suffix = "_L" .. launchCount
     local function wrapped(ev, name, fn, ...)
         local uname = tostring(name) .. suffix
@@ -7654,7 +7716,7 @@ local function launchScript(opt)
         local isDraw = tostring(ev):lower() == "ondraw"
         return realAddHook(ev, uname, function(...)
             if not gate.alive then return false end
-            if UI.hidden and isDraw then
+            if (UI.hidden or loader.scriptMin) and isDraw then
                 -- hidden: still run the hook (timers / ticks), but draw nothing
                 if pcall(function() ImGui = NULL_IMGUI end) then
                     pcall(fn, ...)
@@ -7687,12 +7749,37 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     pcall(AB.tick)                                -- Auto Buff keeps running with a script launched / menus hidden
     if loader.launched then
         -- A script is running: only its own window shows, until it asks to Return.
+        if SCRIPT_MIN_REQ then SCRIPT_MIN_REQ = false; loader.scriptMin = true end
+        if loader.scriptMin and not UI.hidden and not ACTIVE.returnReq then
+            -- script window minimized: small bar with restore (B) only
+            local mc, mv = pushTheme()
+            -- first open: centered horizontally at the top of the screen (you can still drag it)
+            pcall(function()
+                local io = ImGui.GetIO()
+                local ds = io.DisplaySize
+                local sw = (type(ds) == "table" or type(ds) == "userdata") and ds.x or io.DisplaySizeX
+                if type(sw) == "number" and sw > 0 then
+                    ui("SetNextWindowPos", sw / 2 - 80, 12, 4)
+                end
+            end)
+            beginWindow("Ben Loader Script Mini", 200, 0, 140, 34, true)
+            local _, my = ui("GetCursorPosY")
+            local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+            if sizedButton(" B ", 26, 26) then loader.scriptMin = false end
+            popCols(n)
+            ui("SameLine")
+            if type(my) == "number" then ui("SetCursorPosY", my + 5) end   -- text centered with the buttons
+            textColored(C.white, tostring(loader.launchedName or "Script"))
+            ImGui.End()
+            popTheme(mc, mv)
+        end
         if not ACTIVE.returnReq then return end
         ACTIVE.returnReq = false
         pcall(function() if ACTIVE.stop then ACTIVE.stop() end end)
         killGate()
         ACTIVE.stop = nil
         loader.launched, loader.launchedName, loader.err = false, nil, nil
+        loader.scriptMin, SCRIPT_MIN_REQ = false, false
         LogToConsole("`2[Ben Loader] `wReturned to the loader - script stopped, hooks removed.")
     end
 
@@ -7700,12 +7787,12 @@ AddHook("ondraw", "script_loader_menu", function(dt)
 
     local nc, nv = pushTheme()
     if loader.minimized then
-        beginWindow("Ben Loader Mini", 190, 0, 150, 46)
+        beginWindow("Ben Loader Mini", 130, 0, 100, 34, true)
         local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
-        if sizedButton(" B ", 30, 30) then loader.minimized = false end
+        if sizedButton(" B ", 26, 26) then loader.minimized = false end
         popCols(n)
         ui("SameLine")
-        shinyText("Ben Loader", 1.1)
+        shinyText("Ben Loader", 1.0)
         ImGui.End()
         popTheme(nc, nv)
         return

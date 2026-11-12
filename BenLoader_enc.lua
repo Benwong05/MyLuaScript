@@ -16,7 +16,7 @@ local FANCY_UI = true
 -- true = show the normal window title bar, false = custom header (logo + title + Return)
 local SHOW_TITLEBAR = false
 -- Overall size of every window / button / text. 1.0 = old size, 0.8 = smaller (default). Try 0.7 for even smaller.
-local UI_SCALE = 0.8
+local UI_SCALE = 0.92
 
 ---------------- PALETTE ------------------------------
 local ACC        = { 0.93, 0.40, 0.08, 1 }    -- main orange
@@ -1368,9 +1368,24 @@ local function tabWebhook()
     end
 end
 
+---------------- BACKGROUND THREAD --------------------
+-- tick() runs in its own thread so Auto SB keeps working when Growtopia is
+-- minimized (the draw hook does not fire then). Falls back to the draw hook
+-- if this executor has no RunThread.
+local bg = { alive = true }
+local threaded = false
+if type(RunThread) == "function" and type(Sleep) == "function" then
+    threaded = pcall(RunThread, function()
+        while bg.alive do
+            pcall(tick)
+            Sleep(200)
+        end
+    end)
+end
+
 ---------------- DRAW ---------------------------------
 AddHook("ondraw", "autosb_menu", function(dt)
-    tick()
+    if not threaded then tick() end
 
     local nc, nv = pushTheme()
 
@@ -1424,7 +1439,7 @@ pickEmoji()
 loadConfig(true)                              -- load saved settings on startup
 say("`2[Auto SB] v4 loaded." .. (S.cfgPath and " Config loaded." or ""))
 
-ACTIVE.stop = function() stop("returned to loader.") end
+ACTIVE.stop = function() bg.alive = false stop("returned to loader.") end
 
 end  -- startAutoSB
 
@@ -3404,7 +3419,9 @@ local function drawBody()
 end
 
 local drawErrors = 0
-AddHook("ondraw", "gwk_menu", function(dt)
+-- Break timer + dead geiger count. Runs in its own thread so it keeps working
+-- when Growtopia is minimized (the draw hook does not fire then).
+local function bgTick()
     -- break timer (the hunt thread picks up breakLoop)
     if S.running and os.time() - S.lastBreak >= cfg.breakMin * 60 then
         S.lastBreak = os.time()
@@ -3420,6 +3437,21 @@ AddHook("ondraw", "gwk_menu", function(dt)
             S.deadShown = math.max(0, S.deadDropped + inv - S.deadOffset)
         end
     end
+end
+
+local bgAlive = true
+local bgThreaded = false
+if type(RunThread) == "function" and type(Sleep) == "function" then
+    bgThreaded = pcall(RunThread, function()
+        while bgAlive do
+            pcall(bgTick)
+            Sleep(250)
+        end
+    end)
+end
+
+AddHook("ondraw", "gwk_menu", function(dt)
+    if not bgThreaded then bgTick() end
 
     local nc, nv = pushTheme()
     beginWindow("Auto Geiger", 600, 520)
@@ -3444,7 +3476,7 @@ math.randomseed(os.time())
 loadConfig(true)                              -- load saved settings on startup
 say("`2[Auto Geiger] loaded." .. (S.cfgPath and " Config loaded." or ""))
 
-ACTIVE.stop = function() stopRun("returned to loader.") end
+ACTIVE.stop = function() bgAlive = false stopRun("returned to loader.") end
 
 end  -- startGeiger
 
@@ -6836,8 +6868,8 @@ for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
 
 local S = {
     running = false,
+    threadAlive = false,
     sent = 0,
-    lastClock = 0,
     captureArmed = false,
     cfgPath = nil,
     uiMsg = nil, uiOk = true, uiUntil = 0,
@@ -6923,25 +6955,41 @@ local function stop(reason)
     say("`4[Auto Spam] Stopped: `w" .. reason)
 end
 
-local function start()
-    if cfg.text == "" then say("`4[Auto Spam] Please enter a spam text first.") return end
-    cfg.delay = math.max(100, cfg.delay)
-    saveConfig(true)
-    S.running = true
-    S.lastClock = 0                           -- first line goes out right away
-    say("`2[Auto Spam] Started, delay " .. cfg.delay .. "ms")
+-- The loop runs in its own thread (not in the draw hook), so it keeps
+-- spamming even when Growtopia is minimized and nothing is being drawn.
+local function mainLoop()
+    while S.running do
+        -- not in a world (disconnected / world menu): wait instead of spamming nothing
+        local okW, w = pcall(function() return GetWorld() end)
+        if not (okW and w == nil) then
+            if cfg.text ~= "" then
+                sendText(cfg.text)
+                S.sent = S.sent + 1
+            end
+        end
+        -- sleep in small steps so STOP reacts fast even with a long delay
+        local left = math.max(100, cfg.delay)
+        while S.running and left > 0 do
+            local step = math.min(left, 200)
+            Sleep(step)
+            left = left - step
+        end
+    end
 end
 
-local function tick()
-    if not S.running then return end
-    local clock = os.clock()
-    if S.lastClock ~= 0 and (clock - S.lastClock) * 1000 < cfg.delay then return end
-    -- not in a world (disconnected / world menu): wait instead of spamming nothing
-    local okW, w = pcall(function() return GetWorld() end)
-    if okW and w == nil then return end
-    sendText(cfg.text)
-    S.sent = S.sent + 1
-    S.lastClock = clock
+local function start()
+    if S.threadAlive then setMsg("Still stopping, try again in a second.", false) return end
+    if cfg.text == "" then say("`4[Auto Spam] Please enter a spam text first.") return end
+    if type(RunThread) ~= "function" then setMsg("RunThread not found in this executor.", false) return end
+    cfg.delay = math.max(100, cfg.delay)
+    saveConfig(true)
+    S.running, S.threadAlive = true, true
+    say("`2[Auto Spam] Started, delay " .. cfg.delay .. "ms")
+    RunThread(function()
+        local ok, err = pcall(mainLoop)
+        if not ok then say("`4[Auto Spam] `wError: " .. tostring(err)) end
+        S.running, S.threadAlive = false, false
+    end)
 end
 
 ---------------- UI ----------------
@@ -6951,7 +6999,6 @@ local function intInput(label, key, min)
 end
 
 AddHook("ondraw", "autospam_menu", function(dt)
-    tick()
     local nc, nv = pushTheme()
     beginWindow("Auto Spam", 520, 400)
     local widthPushed = ui("PushItemWidth", 240 * UI_SCALE)
@@ -7949,9 +7996,20 @@ local function radioPicked(a, b)
     return a == true
 end
 
+-- Auto Buff runs in its own thread so it keeps eating when Growtopia is minimized.
+local abThreaded = false
+if type(RunThread) == "function" and type(Sleep) == "function" then
+    abThreaded = pcall(RunThread, function()
+        while true do
+            pcall(AB.tick)
+            Sleep(150)
+        end
+    end)
+end
+
 AddHook("ondraw", "script_loader_menu", function(dt)
     pcall(hotkeyTick)
-    pcall(AB.tick)                                -- Auto Buff keeps running with a script launched / menus hidden
+    if not abThreaded then pcall(AB.tick) end     -- Auto Buff keeps running with a script launched / menus hidden
     if loader.launched then
         -- A script is running: only its own window shows, until it asks to Return.
         if SCRIPT_MIN_REQ then SCRIPT_MIN_REQ = false; loader.scriptMin = true end

@@ -6816,6 +6816,210 @@ do
     LogToConsole("`2[BuyBGL] `oReady. Type /buybgl to toggle.")
 end
 
+local function startAutoSpam()
+--====================================================
+--  AUTO SPAM  (plain world-chat spam) + ImGui menu
+--  - same concept as Auto SB: type the text or capture it from a sign
+--  - spam delay in milliseconds, runs until you press STOP
+--  - no amount / total, no gems, no warping
+--====================================================
+
+local cfg = {
+    text  = "Selling items! Visit my world!",
+    delay = 3000,            -- milliseconds between each spam line
+}
+
+local CONFIG_PATHS = { "autospam_config.txt", "scripts/autospam_config.txt", "/sdcard/autospam_config.txt" }
+local SAVE_KEYS = { "text", "delay" }
+local SAVE_SET = {}
+for _, k in ipairs(SAVE_KEYS) do SAVE_SET[k] = true end
+
+local S = {
+    running = false,
+    sent = 0,
+    lastClock = 0,
+    captureArmed = false,
+    cfgPath = nil,
+    uiMsg = nil, uiOk = true, uiUntil = 0,
+}
+
+local function say(msg) LogToConsole(msg) end
+local function sendText(text) SendPacket(2, "action|input\n|text|" .. text) end
+local function strip(s) return (tostring(s):gsub("`%S", "")) end
+local function setMsg(text, ok) S.uiMsg, S.uiOk, S.uiUntil = text, ok, os.time() + 5 end
+
+---------------- CONFIG ----------------
+local function saveConfig(silent)
+    local lines = {}
+    for _, k in ipairs(SAVE_KEYS) do lines[#lines + 1] = k .. "=" .. tostring(cfg[k]) end
+    local data = table.concat(lines, "\n") .. "\n"
+    local order = {}
+    if S.cfgPath then order[1] = S.cfgPath end
+    for _, p in ipairs(CONFIG_PATHS) do order[#order + 1] = p end
+    for _, p in ipairs(order) do
+        local ok, f = pcall(io.open, p, "w")
+        if ok and f then
+            if pcall(function() f:write(data) f:close() end) then
+                S.cfgPath = p
+                if not silent then setMsg("Config saved (" .. p .. ")", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("Could not save config (no writable path)", false) end
+    return false
+end
+
+local function loadConfig(silent)
+    for _, p in ipairs(CONFIG_PATHS) do
+        local ok, f = pcall(io.open, p, "r")
+        if ok and f then
+            local rok, data = pcall(function() local d = f:read("*a") f:close() return d end)
+            if rok and data and data ~= "" then
+                for line in data:gmatch("[^\r\n]+") do
+                    local k, v = line:match("^(%w+)=(.*)$")
+                    if k and SAVE_SET[k] and cfg[k] ~= nil then
+                        if type(cfg[k]) == "number" then cfg[k] = tonumber(v) or cfg[k] else cfg[k] = v end
+                    end
+                end
+                cfg.delay = math.max(100, cfg.delay)
+                S.cfgPath = p
+                if not silent then setMsg("Config loaded", true) end
+                return true
+            end
+        end
+    end
+    if not silent then setMsg("No saved config found", false) end
+    return false
+end
+
+local DEFAULTS = {}
+for _, k in ipairs(SAVE_KEYS) do DEFAULTS[k] = cfg[k] end
+
+---------------- SIGN TEXT CAPTURE ----------------
+-- Armed by the "Capture from Sign" button, grabs the text of the next
+-- sign-edit dialog (wrench a sign) and disarms itself after one attempt.
+AddHook("onvariant", "autospam_sign_capture", function(var)
+    if not S.captureArmed then return false end
+    if var[0] ~= "OnDialogRequest" then return false end
+    local dialog = tostring(var[1] or "")
+    if not dialog:find("sign_edit", 1, true) then return false end
+
+    S.captureArmed = false
+    local text = dialog:match("add_text_input|display_text||(.-)|%d+|")
+    if not text then
+        setMsg("Could not find text in that dialog.", false)
+        return false
+    end
+    cfg.text = text                           -- keep colour codes like the sign has
+    setMsg("Captured from sign: " .. strip(text), true)
+    say("`2[Auto Spam] `wCaptured spam text from sign: `9" .. strip(text))
+    return false
+end)
+
+---------------- START / STOP / LOOP ----------------
+local function stop(reason)
+    S.running = false
+    say("`4[Auto Spam] Stopped: `w" .. reason)
+end
+
+local function start()
+    if cfg.text == "" then say("`4[Auto Spam] Please enter a spam text first.") return end
+    cfg.delay = math.max(100, cfg.delay)
+    saveConfig(true)
+    S.running = true
+    S.lastClock = 0                           -- first line goes out right away
+    say("`2[Auto Spam] Started, delay " .. cfg.delay .. "ms")
+end
+
+local function tick()
+    if not S.running then return end
+    local clock = os.clock()
+    if S.lastClock ~= 0 and (clock - S.lastClock) * 1000 < cfg.delay then return end
+    -- not in a world (disconnected / world menu): wait instead of spamming nothing
+    local okW, w = pcall(function() return GetWorld() end)
+    if okW and w == nil then return end
+    sendText(cfg.text)
+    S.sent = S.sent + 1
+    S.lastClock = clock
+end
+
+---------------- UI ----------------
+local function intInput(label, key, min)
+    local _, v = ImGui.InputInt(label, cfg[key])
+    if v then cfg[key] = math.max(min, v) end
+end
+
+AddHook("ondraw", "autospam_menu", function(dt)
+    tick()
+    local nc, nv = pushTheme()
+    beginWindow("Auto Spam", 520, 400)
+    local widthPushed = ui("PushItemWidth", 240 * UI_SCALE)
+    returnButton()
+
+    if not S.running then
+        if bigButton(">  START SPAM") then start() end
+    else
+        if bigButton("[]  STOP SPAM",
+            { 0.72, 0.20, 0.20, 1 }, { 0.85, 0.26, 0.26, 1 }, { 0.60, 0.15, 0.15, 1 }) then
+            stop("stopped by user.")
+        end
+    end
+
+    section("CONFIG")
+    textColored(C.gray, S.cfgPath or "autospam_config.txt")
+    ui("SameLine")
+    if button(" Save ", 70, 0) then saveConfig() end
+    ui("SameLine")
+    if button(" Load ", 70, 0) then loadConfig() end
+    ui("SameLine")
+    if button(" Default ", 80, 0) then
+        for _, k in ipairs(SAVE_KEYS) do cfg[k] = DEFAULTS[k] end
+        setMsg("Settings reset to default", true)
+    end
+    if S.uiMsg and os.time() < S.uiUntil then
+        textColored(S.uiOk and C.green or C.red, S.uiMsg)
+    end
+
+    section("STATUS")
+    textColored(S.running and C.green or C.white, S.running and "Running" or "Idle")
+    rowv("Lines sent", tostring(S.sent), C.white)
+    if button("Reset Count", -1, 26) then S.sent = 0 end
+
+    section("SPAM")
+    local _, t = ImGui.InputText("Spam Text", cfg.text, 128)
+    if t then cfg.text = t end
+
+    if S.captureArmed then
+        if button(" Waiting... click to cancel ") then
+            S.captureArmed = false
+            setMsg("Capture cancelled.", true)
+        end
+        textColored(C.cyan, "Now go wrench/punch the sign in-game.")
+    else
+        if button(" Capture from Sign ") then
+            S.captureArmed = true
+            setMsg("Armed - go wrench a sign now.", true)
+        end
+        textColored(C.gray, "Click, then wrench a sign to copy its text.")
+    end
+
+    intInput("Delay (ms)", "delay", 100)
+    textColored(C.gray, string.format("= %.1f seconds between each line", cfg.delay / 1000))
+    textColored(C.gray, "Preview: " .. strip(cfg.text))
+
+    if widthPushed then ui("PopItemWidth") end
+    ImGui.End()
+    popTheme(nc, nv)
+end)
+
+loadConfig(true)
+say("`2[Auto Spam] loaded." .. (S.cfgPath and " Config loaded." or ""))
+
+ACTIVE.stop = function() stop("returned to loader.") end
+
+end  -- startAutoSpam
+
 local LOADER_OPTIONS = {
     { name = "Auto Super Broadcast", run = startAutoSB },
     { name = "Vend Helper",          run = startVendHelper },
@@ -6824,6 +7028,7 @@ local LOADER_OPTIONS = {
     { name = "Auto Geiger Charger",   run = startAutoCharger },
     { name = "Tax to UWS",            run = startTaxToUWS },
     { name = "Auto Drop / Trash",     run = startAutoDrop },
+    { name = "Auto Spam",             run = startAutoSpam },
 }
 local loader = { selected = 1, launched = false, launchedName = nil, err = nil, gate = nil }
 

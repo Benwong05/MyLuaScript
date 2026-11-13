@@ -11,6 +11,15 @@
 --  orange ON/OFF toggles. Change the look in ONE place (the PALETTE).
 --====================================================
 
+-- CRASH-DEBUG SWITCHES (flip one at a time if the game crashes) ---------
+-- NEW_LAYOUT = false  -> old single-window loader layout (same Nyxora colours)
+-- HOVER_ANIM = false  -> no hover glow (skips ImGui.IsItemHovered)
+-- ANIMATIONS = false  -> every animated value jumps straight to its target
+local NEW_LAYOUT = true
+local HOVER_ANIM = false
+local ANIMATIONS = true
+--------------------------------------------------------------------------
+
 -- Set to false if your menu glitches: falls back to plain ImGui widgets.
 local FANCY_UI = true
 -- true = show the normal window title bar, false = custom header (logo + title + Return)
@@ -232,6 +241,7 @@ local function mix(c1, c2, t)
     return { lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t), lerp(c1[3], c2[3], t), lerp(c1[4], c2[4], t) }
 end
 local function animTo(key, target, speed)
+    if not ANIMATIONS then return target end
     local now = os.clock()
     local st = ANIM[key]
     if not st then ANIM[key] = { v = target, t = now } return target end
@@ -243,6 +253,7 @@ local function animTo(key, target, speed)
 end
 local function hoverState(key) return HOVER[key] and 1 or 0 end
 local function readHover(key)
+    if not HOVER_ANIM then return end
     local ok, h = ui("IsItemHovered")
     HOVER[key] = ok and h == true
 end
@@ -263,7 +274,7 @@ end
 
 local function pushTheme()
     local nc, nv = 0, 0
-    if pushVar("Alpha", fadeAlpha()) then nv = nv + 1 end
+
     for _, e in ipairs(THEME_COLORS) do if pushCol(e[1], e[2]) then nc = nc + 1 end end
     for _, e in ipairs(THEME_VARS)   do if pushVar(e[1], e[2]) then nv = nv + 1 end end
     return nc, nv
@@ -415,13 +426,18 @@ local beginMode = nil                         -- "flags" | "plain"
 
 -- Opens the window. Custom look = no title bar (header is drawn by drawHeader).
 -- Always finish with ImGui.End().
+local WIN_W, WIN_H = 780, 490                    -- default size of the loader and every script window (resizable)
 local MIN_W, MIN_H = 430, 300                   -- window can't be resized smaller than this (tiny windows crashed ImGui)
 local FONT_SET = false
 local function beginWindow(title, w, h, minW, minH, mini)
     CUR_TITLE = title
     if WIN_FADE.title ~= title then WIN_FADE.title = title; WIN_FADE.t0 = os.clock() end
     minW, minH = (minW or MIN_W) * UI_SCALE, (minH or MIN_H) * UI_SCALE
-    ui("SetNextWindowSize", (w or 560) * UI_SCALE, (h or 0) * UI_SCALE, 4)      -- first-use size, you can still resize
+    if mini then
+        ui("SetNextWindowSize", (w or 560) * UI_SCALE, (h or 0) * UI_SCALE, 4)
+    else
+        ui("SetNextWindowSize", WIN_W * UI_SCALE, WIN_H * UI_SCALE, 4)          -- default size; you can resize
+    end
     if FANCY_UI and type(ImVec2) == "function" then
         local done = pcall(ImGui.SetNextWindowSizeConstraints, ImVec2(minW, minH), ImVec2(4000, 4000))
         if not done then pcall(ImGui.SetNextWindowSizeConstraints, minW, minH, 4000, 4000) end
@@ -8067,6 +8083,471 @@ if type(RunThread) == "function" and type(Sleep) == "function" then
     end)
 end
 
+
+---------------- NYXORA LOADER LAYOUT ------------------
+-- Sidebar (brand card, collapsible groups, profile card) + top pill tabs +
+-- card panels. Everything eases: group expand/collapse, nav glow, content fade.
+local LOADER_GROUPS = {
+    { name = "Broadcast",  col = { 1.00, 0.42, 0.72 }, items = { "Auto Super Broadcast", "Auto Spam" } },                          -- pink
+    { name = "Economy",    col = { 1.00, 0.80, 0.28 }, items = { "Vend Helper", "Tax to UWS", "Auto Drop / Trash" } },             -- gold
+    { name = "Automation", col = { 0.35, 0.85, 1.00 }, items = { "Auto Geiger", "Auto Geiger Charger", "Auto Crystal Combine" } }, -- cyan
+}
+local LOADER_DESC = {
+    ["Auto Super Broadcast"] = "Sends Super Broadcasts on a timer, with stats, advanced options and Discord webhook logging.",
+    ["Auto Spam"]            = "Repeats a chat message at an interval you choose.",
+    ["Vend Helper"]          = "Speeds up vending machine dialogs: stocking, buying and selling.",
+    ["Tax to UWS"]           = "Handles tax payments to a world with fewer manual steps.",
+    ["Auto Drop / Trash"]    = "Drops or trashes chosen items automatically.",
+    ["Auto Geiger"]          = "Automates Geiger Counter hunting and the steps around it.",
+    ["Auto Geiger Charger"]  = "Keeps your Geiger Counter charged automatically.",
+    ["Auto Crystal Combine"] = "Combines crystals automatically.",
+}
+local LUI = { tab = 1, open = { true, true, true }, lastSel = nil }
+local LUI_TABS = { "Scripts", "Hotkey & Tools", "About" }
+
+local function findOpt(name)
+    for i, o in ipairs(LOADER_OPTIONS) do if o.name == name then return i end end
+end
+local function groupOf(name)
+    for _, g in ipairs(LOADER_GROUPS) do
+        for _, n in ipairs(g.items) do if n == name then return g.name end end
+    end
+    return "General"
+end
+local function winPx()
+    local ok, w = pcall(ImGui.GetWindowWidth)
+    return (ok and type(w) == "number") and w or 600
+end
+local function winPy()
+    local ok, h = pcall(ImGui.GetWindowHeight)
+    return (ok and type(h) == "number") and h or 400
+end
+local function rawAccountName()
+    local ok, n = pcall(function() return GetLocal().name end)
+    if ok and type(n) == "string" and n ~= "" then return n end
+    return "Player"
+end
+local function accountName()
+    local ok, n = pcall(function() return GetLocal().name end)
+    if ok and type(n) == "string" and n ~= "" then return (n:gsub("`.", "")) end
+    return "Player"
+end
+
+local function beginCard(id, w, h)
+    local pc = pushCol("ChildBg", { 0.085, 0.090, 0.102, 0.90 }) and 1 or 0
+    local o = beginChild(id, w, h, true)
+    popCols(pc)
+    return o
+end
+local function endCard(o) if o then ui("EndChild") end end
+local function cardTitle(title, sub)
+    textColored(C.white, title)
+    if sub then textColored(C.gray, sub) end
+    ui("Spacing"); ImGui.Separator(); ui("Spacing")
+end
+
+local function tw(t)                                -- real text width in pixels (falls back to an estimate)
+    local ok, mw = ui("CalcTextSize", t)
+    if ok then
+        if type(mw) ~= "number" then
+            local o, x = pcall(function() return mw.x end)
+            mw = o and x or nil
+        end
+        if type(mw) == "number" then return mw end
+    end
+    return #t * 7.4 * UI_SCALE
+end
+local function maxChars(wUnscaled) return wUnscaled end      -- kept name: wrapped() now takes a width
+local function cutPx(str, px)                         -- shorten with ".." until it fits px pixels
+    str = tostring(str)
+    if tw(str) <= px then return str end
+    while #str > 1 and tw(str .. "..") > px do str = str:sub(1, #str - 1) end
+    return str .. ".."
+end
+
+-- Growtopia colour codes (`2 green, `4 red, `w white, `` reset ...) -> RGB
+local GT_COL = {
+    ["0"] = { 1, 1, 1 },        ["1"] = { 0.45, 0.85, 1 },   ["2"] = { 0.31, 1, 0.31 },  ["3"] = { 0.55, 0.75, 1 },
+    ["4"] = { 1, 0.35, 0.35 },  ["5"] = { 0.90, 0.60, 1 },   ["6"] = { 0.90, 0.62, 0.25 }, ["7"] = { 0.72, 0.72, 0.72 },
+    ["8"] = { 1, 0.60, 0.20 },  ["9"] = { 1, 0.90, 0.40 },   ["!"] = { 0.70, 1, 1 },     ["@"] = { 1, 0.80, 0.80 },
+    ["#"] = { 1, 0.35, 0.70 },  ["$"] = { 1, 0.90, 0.30 },   ["%"] = { 1, 0.40, 0.40 },  ["^"] = { 0.60, 1, 0.60 },
+    ["&"] = { 1, 0.70, 1 },     w = { 1, 1, 1 },             o = { 0.60, 0.85, 1 },      p = { 1, 0.70, 0.85 },
+    q = { 0.30, 0.40, 0.90 },   r = { 0.60, 1, 0.50 },       s = { 0.85, 0.60, 0.35 },   t = { 0.40, 0.90, 0.85 },
+    a = { 0.30, 0.70, 0.30 },   b = { 0.45, 0.45, 0.45 },    c = { 0.20, 0.70, 0.70 },   e = { 0.70, 1, 1 },
+}
+local function gtSegments(raw)                         -- "`2Dr.`4Name``" -> { {text, {r,g,b}}, ... }
+    local segs, col, buf, i = {}, { 0.93, 0.93, 0.94 }, "", 1
+    raw = tostring(raw or "")
+    while i <= #raw do
+        local ch = raw:sub(i, i)
+        if ch == "`" and i < #raw then
+            if #buf > 0 then segs[#segs + 1] = { buf, col }; buf = "" end
+            local c = raw:sub(i + 1, i + 1)
+            if c == "`" then col = { 0.93, 0.93, 0.94 } else col = GT_COL[c] or col end
+            i = i + 2
+        else
+            buf = buf .. ch
+            i = i + 1
+        end
+    end
+    if #buf > 0 then segs[#segs + 1] = { buf, col } end
+    return segs
+end
+-- draws a colour-coded name. If it is wider than maxPx it WRAPS onto the next
+-- line (at spaces when possible) so the whole name stays readable. Only after
+-- maxLines lines is the rest cut with "..".
+local GT_LINES = {}
+local function gtLines(raw, maxPx, maxLines)
+    local key = tostring(raw) .. "|" .. math.floor(maxPx) .. "|" .. maxLines
+    if GT_LINES[key] then return GT_LINES[key] end
+    local segs = gtSegments(raw)
+    local plain, cols = "", {}
+    for _, sg in ipairs(segs) do
+        for _ = 1, #sg[1] do cols[#cols + 1] = sg[2] end
+        plain = plain .. sg[1]
+    end
+    local res = { plain = plain, cols = cols, lines = {}, dots = false }
+    local pos, n = 1, #plain
+    while pos <= n and #res.lines < maxLines do
+        local j = pos                                       -- largest j that still fits
+        while j < n and tw(plain:sub(pos, j + 1)) <= maxPx do j = j + 1 end
+        local e, nxt
+        if j >= n then
+            e, nxt = n, n + 1
+        else
+            local sp
+            for q = j + 1, pos + 1, -1 do
+                if plain:sub(q, q) == " " then sp = q break end
+            end
+            if sp then e, nxt = sp - 1, sp + 1 else e, nxt = j, j + 1 end
+        end
+        res.lines[#res.lines + 1] = { pos, e }
+        pos = nxt
+    end
+    if pos <= n and #res.lines > 0 then                     -- still text left: cut the last line with ".."
+        local l = res.lines[#res.lines]
+        while l[2] > l[1] and tw(plain:sub(l[1], l[2]) .. "..") > maxPx do l[2] = l[2] - 1 end
+        res.dots = true
+    end
+    GT_LINES[key] = res
+    return res
+end
+local function gtName(raw, maxPx)
+    local info = gtLines(raw, maxPx, 3)
+    if info.plain == "" then textColored(C.white, "Player") return end
+    for li, l in ipairs(info.lines) do
+        local i = l[1]
+        local first = true
+        while i <= l[2] do
+            local col, j = info.cols[i], i
+            while j < l[2] and info.cols[j + 1] == col do j = j + 1 end
+            local t = info.plain:sub(i, j)
+            if info.dots and li == #info.lines and j == l[2] then t = t .. ".." end
+            if not first then ui("SameLine", 0, 0) end
+            first = false
+            textColored({ col[1], col[2], col[3], 1 }, t)
+            i = j + 1
+        end
+    end
+end
+
+local function vecXY(ok, a, b)                           -- number pair or ImVec2 -> x, y
+    if not ok then return nil end
+    if type(a) == "number" then return a, b end
+    local o, x, y = pcall(function() return a.x, a.y end)
+    if o and type(x) == "number" then return x, y end
+    return nil
+end
+
+-- SameLine to an exact x (window space). Some ImGui builds add an extra offset
+-- (child padding), so read the real cursor back and correct it.
+local function sameLineAt(x)
+    if type(ImGui.SetCursorPosX) == "function" then
+        ui("SameLine", 0, 0)                      -- stay on the previous line (keeps its Y)
+        if pcall(ImGui.SetCursorPosX, x) then return end
+    end
+    ui("SameLine", x, 0)
+    local ok, cx = ui("GetCursorPosX")
+    if ok and type(cx) == "number" and math.abs(cx - x) > 0.5 then
+        ui("SameLine", x - (cx - x), 0)
+    end
+end
+
+-- shimmer text: draws chars with a travelling white highlight. Does NOT touch the
+-- font scale (set it before calling) so every character has identical metrics.
+--   base  = {r,g,b}  tint of the text (nil = soft grey/white)
+--   bold  = true     draws the text a second time 1px to the right (fake bold)
+--   yTop  = number   force every char to this cursor Y (keeps the whole word on ONE
+--                    baseline when it follows a button on the same line)
+--   xStart= number   start the first char at this x (window space) with SameLine
+local function shinyRun(text, speed, base, bold, yTop, xStart)
+    local t = os.clock()
+    local n = #text
+    local pos = (t * (speed or 7)) % (n + 10) - 5
+    local okx, x0 = ui("GetCursorPosX")
+    if not (okx and type(x0) == "number") then x0 = nil end
+    local smin, emax
+    local function pass(startX, measure)
+        for i = 1, n do
+            if i == 1 then
+                if startX then sameLineAt(startX) end
+            else
+                ui("SameLine", 0, 0)
+            end
+            if yTop then ui("SetCursorPosY", yTop) end
+            local k = math.max(0, 1 - math.abs(i - pos) / 3.0)
+            local r, g, b
+            if base then
+                local m = 0.88 + 0.12 * k
+                local w = k * 0.85                           -- how far to push toward white
+                r = math.min(1, base[1] * m + (1 - base[1] * m) * w)
+                g = math.min(1, base[2] * m + (1 - base[2] * m) * w)
+                b = math.min(1, base[3] * m + (1 - base[3] * m) * w)
+            else
+                local v = 0.62 + 0.38 * k
+                r, g, b = v, v, math.min(1, v + 0.04)
+            end
+            if measure and (i == 1 or i == n) then            -- real cursor x right before the char is drawn
+                local okc, cxx = ui("GetCursorPosX")
+                if okc and type(cxx) == "number" then
+                    if i == 1 then smin = cxx end
+                    if i == n then emax = cxx + tw(text:sub(i, i)) end
+                end
+            end
+            textColored({ r, g, b, 1 }, text:sub(i, i))
+        end
+    end
+    pass(xStart, true)
+    if bold then
+        local sx = xStart or x0
+        if sx then pass(sx + 1) end
+    end
+    return smin, emax
+end
+
+-- category header: filled bar tinted with its own colour, pulsing outline and
+-- bold shimmering label in that colour (each category gets a different one)
+local CAT_W = {}                                             -- per-header real text width
+local function catItem(label, base, idx, sign)
+    base = base or { 0.80, 0.82, 0.88 }
+    local _, cx = ui("GetCursorPosX")
+    local _, cy = ui("GetCursorPosY")
+    local pulse = 0.5 + 0.5 * math.sin(os.clock() * 2 + (idx or 0) * 1.7)
+    local bg  = { base[1] * 0.20 + 0.05, base[2] * 0.20 + 0.05, base[3] * 0.20 + 0.06, 1 }
+    local hov = { base[1] * 0.32 + 0.06, base[2] * 0.32 + 0.06, base[3] * 0.32 + 0.07, 1 }
+    local act = { base[1] * 0.14 + 0.05, base[2] * 0.14 + 0.05, base[3] * 0.14 + 0.06, 1 }
+    local n = pushBtn(bg, hov, act, { 0, 0, 0, 0 })           -- label is drawn by shinyRun on top
+    if pushCol("Border", { base[1], base[2], base[3], 0.30 + 0.40 * pulse }) then n = n + 1 end
+    local nv = pushVar("FrameBorderSize", 1) and 1 or 0
+    local r = sizedButton("##cat" .. tostring(idx or label), -1, 26)
+    local bw, bh = vecXY(ui("GetItemRectSize"))
+    local bminx = vecXY(ui("GetItemRectMin"))
+    local bmaxx = vecXY(ui("GetItemRectMax"))
+    popVars(nv); popCols(n)
+    bw = bw or (200 * UI_SCALE)
+    bh = bh or (26 * UI_SCALE)
+    local okh, lh = ui("GetTextLineHeight")
+    if not (okh and type(lh) == "number") then lh = 13 * UI_SCALE end
+    local fp = 6 * UI_SCALE                                   -- FramePadding.y of the theme
+    local textW = CAT_W[idx] or tw(label)                      -- real drawn width (measured, 1 frame lag)
+    local textX = winPx() / 2 - textW / 2                      -- the sidebar bar is symmetric -> window middle
+    local textY = (cy or 0) + (bh - lh) / 2 - fp
+    if sign then                                               -- +/- sits at the left edge of the bar
+        shinyRun(sign, 5, base, true, textY, (cx or 0) + 12 * UI_SCALE)
+    end
+    local smin, emax = shinyRun(label, 5, base, true, textY, textX)   -- the NAME alone is centred
+    if smin and emax and emax > smin then CAT_W[idx] = emax - smin end
+    if type(cy) == "number" then ui("SetCursorPosY", cy + bh + 8 * UI_SCALE) end   -- back below the bar
+    return r
+end
+
+local function wrapped(col, text, wUnscaled)
+    local px = wUnscaled * UI_SCALE - 44              -- card padding + scrollbar
+    local line = ""
+    for word in tostring(text):gmatch("%S+") do
+        local try = (#line > 0) and (line .. " " .. word) or word
+        if tw(try) > px and #line > 0 then
+            textColored(col, line); line = word
+        else
+            line = try
+        end
+    end
+    if #line > 0 then textColored(col, line) end
+end
+
+local function launchSelected()
+    local opt = LOADER_OPTIONS[loader.selected]
+    local ok, err = launchScript(opt)
+    if ok then
+        loader.launched, loader.launchedName = true, opt.name
+    else
+        loader.err = tostring(err)
+        LogToConsole("`4[Script Loader] Failed to start " .. opt.name .. ": " .. loader.err)
+    end
+end
+
+-- Layout rule: every panel below is a DIRECT child of the window (no child
+-- inside a child), the same structure the original loader used.
+local PANEL_H = 395
+local SIDE_W = 228
+
+local function drawLoaderHeader()
+    local ww = winPx()
+    local _, y = ui("GetCursorPosY")
+    local n = pushBtn(ACC, ACC, ACC, { 1, 1, 1, 1 })
+    if pushCol("Border", { LIGHT[1], LIGHT[2], LIGHT[3], 0.45 + 0.25 * math.sin(os.clock() * 2) }) then n = n + 1 end
+    local nv = pushVar("FrameBorderSize", 1.2) and 1 or 0
+    sizedButton(" B ", 34, 34)
+    popVars(nv); popCols(n)
+    ui("SameLine")
+    -- every letter gets the same Y (SetCursorPosY used to move only the first letter,
+    -- which made the "B" sit lower than "EN LOADER"); y+4 + button baseline = centred on the tile
+    shinyRun("BEN LOADER", 7, nil, false, type(y) == "number" and (y + 4) or nil)
+
+    local x = 190 * UI_SCALE
+    for i, t in ipairs(LUI_TABS) do
+        local tw = math.max(84, #t * 8 + 30)
+        ui("SameLine", x)
+        if type(y) == "number" then ui("SetCursorPosY", y + 3) end
+        if navItem(t, LUI.tab == i, tw, 28) then LUI.tab = i end
+        x = x + (tw + 8) * UI_SCALE
+    end
+    ui("SameLine", math.max(x, ww - 52 * UI_SCALE))
+    if type(y) == "number" then ui("SetCursorPosY", y + 3) end
+    if sizedButton(" _ ", 34, 28) then MINIMIZE_REQ = true end
+    ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+end
+
+local function drawSidebar()
+    local pc = pushCol("ChildBg", { 0.060, 0.065, 0.075, 0.92 }) and 1 or 0
+    local open = beginChild("##lsb", SIDE_W, 0, true)
+    popCols(pc)
+
+    shinyRun("SCRIPT LIBRARY", 6, nil, true)
+    ui("Spacing")
+    for gi, g in ipairs(LOADER_GROUPS) do
+        local o = LUI.open[gi]
+        if catItem(string.upper(g.name), g.col, gi, o and "-" or "+") then LUI.open[gi] = not o end
+        if o then
+            for _, name in ipairs(g.items) do
+                local idx = findOpt(name)
+                if idx and navItem(cutPx(name, SIDE_W * UI_SCALE - 58), loader.selected == idx, -1, 28) then
+                    loader.selected = idx
+                    LUI.tab = 1
+                end
+            end
+        end
+    end
+    ui("Spacing")
+    ImGui.Separator()
+    ui("Spacing")
+    textColored(C.gray, "Player name:")
+    gtName(rawAccountName(), SIDE_W * UI_SCALE - 40)
+    textColored(C.gray, "Hide/Show: " .. (HK.bk and HK.name:upper() or "/loader"))
+    if open then ui("EndChild") end
+end
+
+local function rowTight(label, value, valueColor, colX)   -- label + value, value column close to the labels
+    textColored(C.gray, label)
+    sameLineAt(colX)
+    textColored(valueColor or C.white, value)
+end
+
+local function drawScriptsCards()
+    local opt = LOADER_OPTIONS[loader.selected]
+    if LUI.lastSel ~= loader.selected then
+        LUI.lastSel = loader.selected
+        ANIM["sel:fade"] = { v = 0, t = os.clock() }
+    end
+    local fa = animTo("sel:fade", 1, 9)
+    local avail = winPx() / UI_SCALE - SIDE_W - 46
+    local rw = math.min(SIDE_W, math.floor(avail * 0.5))       -- right card = same width as the left sidebar
+    local lw = math.max(120, math.floor(avail - rw - 8))       -- middle card takes the rest
+
+    local o1 = beginCard("##c_over", lw, 0)
+    cardTitle("Script Overview", "Details about the selected script")
+    ui("SetWindowFontScale", 1.3 * UI_SCALE)
+    textColored({ 0.96, 0.96, 0.98, fa }, opt.name)
+    ui("SetWindowFontScale", UI_SCALE)
+    ui("Spacing")
+    wrapped({ C.gray[1], C.gray[2], C.gray[3], fa }, LOADER_DESC[opt.name] or "No description.", maxChars(lw))
+    ui("Spacing"); ImGui.Separator(); ui("Spacing")
+    local _, px0 = ui("GetCursorPosX")                          -- left edge of the card content
+    local colX = (type(px0) == "number" and px0 or 0) + tw("Hide / Show") + 14 * UI_SCALE
+    rowTight("Category", groupOf(opt.name), C.white, colX)
+    rowTight("Status", loader.launched and "Running" or "Ready", loader.launched and C.yellow or C.green, colX)
+    ui("Spacing"); ImGui.Separator(); ui("Spacing")
+    textColored(C.gray, "Account")
+    gtName(rawAccountName(), lw * UI_SCALE - 44)
+    rowTight("Hide / Show", HK.bk and HK.name:upper() or "/loader", C.gold, colX)
+    rowTight("Scripts", tostring(#LOADER_OPTIONS) .. " available", C.white, colX)
+    endCard(o1)
+
+    ui("SameLine")
+    local o2 = beginCard("##c_launch", rw, 0)
+    cardTitle("Launch", "Only the chosen script starts")
+    wrapped(C.gray, "Nothing runs until you press launch. Use Return in the script window to come back here.", maxChars(rw))
+    ui("Spacing")
+    local lh = animTo("launch:h", hoverState("launch"), 16)
+    local lbg = mix({ 0.76, 0.77, 0.81, 1 }, { 0.92, 0.93, 0.96, 1 }, lh)
+    local ln = pushBtn(lbg, lbg, { 0.66, 0.67, 0.71, 1 }, { 0.06, 0.06, 0.08, 1 })
+    local go = sizedButton(">  LAUNCH", -1, 42)
+    readHover("launch")
+    popCols(ln)
+    if go then launchSelected() end
+    if loader.err then
+        ui("Spacing")
+        wrapped(C.red, "Last error: " .. loader.err, maxChars(rw))
+    end
+    ui("Spacing"); ImGui.Separator(); ui("Spacing")
+    textColored(C.white, "Quick Tips")
+    wrapped(C.gray, "Pick a script on the left, then launch it. Scripts keep running while menus are hidden.", maxChars(rw))
+    endCard(o2)
+end
+
+local function drawLoaderUI()
+    drawLoaderHeader()
+    drawSidebar()
+    ui("SameLine")
+    if LUI.tab == 1 then
+        drawScriptsCards()
+    elseif LUI.tab == 2 then
+        local o = beginCard("##c_hk", 0, 0)
+        cardTitle("Hotkey & Tools", "Hide or show every menu")
+        drawHotkeySection()
+        endCard(o)
+    else
+        local o = beginCard("##c_about", 0, 0)
+        cardTitle("About", "Ben Loader")
+        ui("SetWindowFontScale", 1.5 * UI_SCALE)
+        shinyRun("BEN LOADER", 6, { 0.80, 0.85, 1.00 }, true)
+        ui("SetWindowFontScale", UI_SCALE)
+        ui("Spacing")
+        wrapped(C.gray, "One loader for all your scripts. Only the script you launch registers its hooks; Return stops it and removes them.", maxChars(winPx() / UI_SCALE))   -- inside the card, winPx() IS the card width
+        ui("Spacing"); ImGui.Separator(); ui("Spacing")
+        textColored(C.gray, "Loader by")
+        shinyRun("Ben (PoliceMan)", 6, { 1.00, 0.82, 0.35 }, true)
+        ui("Spacing")
+        textColored(C.gray, "Discord")
+        shinyRun("itsme_wzz", 5, { 0.55, 0.62, 1.00 }, true)
+        ui("Spacing")
+        if sizedButton("Copy Discord", 120, 26) then
+            ui("SetClipboardText", "itsme_wzz")
+            LUI.copied = os.clock()
+        end
+        if LUI.copied and os.clock() - LUI.copied < 2 then
+            ui("SameLine")
+            textColored(C.green, "Copied!")
+        end
+        ui("Spacing"); ImGui.Separator(); ui("Spacing")
+        rowv("Scripts", tostring(#LOADER_OPTIONS), C.white)
+        rowv("Theme", "Nyxora glass", C.white)
+        endCard(o)
+    end
+end
+
 AddHook("ondraw", "script_loader_menu", function(dt)
     pcall(hotkeyTick)
     if not abThreaded then pcall(AB.tick) end     -- Auto Buff keeps running with a script launched / menus hidden
@@ -8126,44 +8607,33 @@ AddHook("ondraw", "script_loader_menu", function(dt)
         popTheme(nc, nv)
         return
     end
-    beginWindow("Ben Loader", 580, 0, 520, 330)
-    drawHeader("Ben Loader", false, true)
-    if MINIMIZE_REQ then MINIMIZE_REQ = false; loader.minimized = true end
-
-    local LIST_H = #LOADER_OPTIONS * 34 + 16
-    local sOpen = beginChild("##scripts", 205, LIST_H, true)
-    section("SELECT A SCRIPT")
-    for i, opt in ipairs(LOADER_OPTIONS) do
-        if navItem(opt.name, loader.selected == i, -1, 28) then loader.selected = i end
-    end
-    if sOpen then ui("EndChild") end
-    ui("SameLine")
-    local tOpen = beginChild("##tools", 0, LIST_H, true)
-    section("HOTKEY & TOOLS")
-    drawHotkeySection()
-    if tOpen then ui("EndChild") end
-
-    ui("Spacing")
-    -- launch button: green, so it is clearly different from the orange selection
-    local lh = animTo("launch:h", hoverState("launch"), 16)
-    local lbg = mix({ 0.76, 0.77, 0.81, 1 }, { 0.92, 0.93, 0.96, 1 }, lh)
-    local ln = pushBtn(lbg, lbg, { 0.66, 0.67, 0.71, 1 }, { 0.06, 0.06, 0.08, 1 })
-    local go = sizedButton(">  LAUNCH  " .. string.upper(LOADER_OPTIONS[loader.selected].name), -1, 40)
-    readHover("launch")
-    popCols(ln)
-    if go then
-        local opt = LOADER_OPTIONS[loader.selected]
-        local ok, err = launchScript(opt)
-        if ok then
-            loader.launched, loader.launchedName = true, opt.name
-        else
-            loader.err = tostring(err)
-            LogToConsole("`4[Script Loader] Failed to start " .. opt.name .. ": " .. loader.err)
+    if NEW_LAYOUT then
+        beginWindow("Ben Loader", WIN_W, WIN_H, 640, 380)
+        if MINIMIZE_REQ then MINIMIZE_REQ = false; loader.minimized = true end
+        drawLoaderUI()
+    else
+        beginWindow("Ben Loader", WIN_W, WIN_H, 640, 380)
+        drawHeader("Ben Loader", false, true)
+        if MINIMIZE_REQ then MINIMIZE_REQ = false; loader.minimized = true end
+        local LIST_H = #LOADER_OPTIONS * 34 + 16
+        local sOpen = beginChild("##scripts", 205, LIST_H, true)
+        section("SELECT A SCRIPT")
+        for i, opt in ipairs(LOADER_OPTIONS) do
+            if navItem(opt.name, loader.selected == i, -1, 28) then loader.selected = i end
         end
+        if sOpen then ui("EndChild") end
+        ui("SameLine")
+        local tOpen = beginChild("##tools", 0, LIST_H, true)
+        section("HOTKEY & TOOLS")
+        drawHotkeySection()
+        if tOpen then ui("EndChild") end
+        ui("Spacing")
+        if sizedButton(">  LAUNCH  " .. string.upper(LOADER_OPTIONS[loader.selected].name), -1, 40) then
+            launchSelected()
+        end
+        if loader.err then textColored(C.red, "Last error: " .. loader.err) end
+        navEnd()
     end
-    if loader.err then textColored(C.red, "Last error: " .. loader.err) end
-
-    navEnd()
     ImGui.End()
     popTheme(nc, nv)
 end)

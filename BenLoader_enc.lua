@@ -18,27 +18,30 @@ local SHOW_TITLEBAR = false
 -- Overall size of every window / button / text. 1.0 = old size, 0.8 = smaller (default). Try 0.7 for even smaller.
 local UI_SCALE = 0.92
 
----------------- PALETTE ------------------------------
-local ACC        = { 0.93, 0.40, 0.08, 1 }    -- main orange
-local ACC_HOVER  = { 1.00, 0.50, 0.16, 1 }
-local ACC_ACTIVE = { 0.78, 0.31, 0.05, 1 }
-local BG         = { 0.070, 0.070, 0.075, 0.98 }
-local PANEL      = { 0.100, 0.100, 0.106, 1.00 }
-local FIELD      = { 0.145, 0.145, 0.152, 1.00 }
-local FIELD_HOV  = { 0.195, 0.195, 0.205, 1.00 }
-local LINE       = { 0.180, 0.180, 0.190, 1.00 }
+---------------- PALETTE (NYXORA look: dark glass + white outline) ----------
+local ACC        = { 0.200, 0.205, 0.235, 1 }    -- filled "selected" surfaces (dark slate)
+local ACC_HOVER  = { 0.260, 0.265, 0.300, 1 }
+local ACC_ACTIVE = { 0.150, 0.155, 0.180, 1 }
+local LIGHT      = { 0.93, 0.93, 0.95, 1 }       -- white outline / check / slider grab
+local TOG_ON     = { 0.80, 0.81, 0.85, 1 }       -- toggle ON (light pill)
+local TOG_ON_HOV = { 0.88, 0.89, 0.92, 1 }
+local BG         = { 0.050, 0.054, 0.062, 0.97 }
+local PANEL      = { 0.085, 0.090, 0.102, 0.94 }
+local FIELD      = { 0.125, 0.130, 0.148, 1.00 }
+local FIELD_HOV  = { 0.175, 0.180, 0.200, 1.00 }
+local LINE       = { 0.260, 0.270, 0.300, 0.55 }
 local CLEAR      = { 0, 0, 0, 0 }
 
 local C = {                                   -- text colours (r, g, b, a)
-    accent = ACC,
-    gold   = { 1.00, 0.64, 0.28, 1 },         -- light accent (highlights)
+    accent = { 0.80, 0.81, 0.85, 1 },
+    gold   = { 0.95, 0.95, 0.97, 1 },         -- light accent (highlights)
     green  = { 0.30, 0.85, 0.45, 1 },
     red    = { 0.95, 0.36, 0.36, 1 },
     cyan   = { 0.45, 0.80, 1.00, 1 },
     yellow = { 1.00, 0.80, 0.30, 1 },
     gray   = { 0.52, 0.52, 0.56, 1 },
     white  = { 0.93, 0.93, 0.94, 1 },
-    purple = ACC,
+    purple = { 0.80, 0.81, 0.85, 1 },
 }
 
 -- Calls an optional ImGui function; silently does nothing if it doesn't exist.
@@ -96,37 +99,37 @@ local THEME_COLORS = {
     { "Border",            LINE },
     { "BorderShadow",      CLEAR },
     { "Separator",         LINE },
-    { "SeparatorHovered",  ACC_HOVER },
-    { "SeparatorActive",   ACC },
+    { "SeparatorHovered",  LIGHT },
+    { "SeparatorActive",   LIGHT },
     { "Button",            FIELD },
     { "ButtonHovered",     FIELD_HOV },
     { "ButtonActive",      ACC_ACTIVE },
     { "FrameBg",           FIELD },
     { "FrameBgHovered",    FIELD_HOV },
     { "FrameBgActive",     { 0.23, 0.23, 0.24, 1.00 } },
-    { "CheckMark",         ACC },
-    { "SliderGrab",        ACC },
-    { "SliderGrabActive",  ACC_HOVER },
-    { "Header",            { 0.93, 0.40, 0.08, 0.35 } },
-    { "HeaderHovered",     { 0.93, 0.40, 0.08, 0.55 } },
-    { "HeaderActive",      { 0.93, 0.40, 0.08, 0.75 } },
-    { "PlotHistogram",     ACC },
-    { "PlotHistogramHovered", ACC_HOVER },
+    { "CheckMark",         LIGHT },
+    { "SliderGrab",        LIGHT },
+    { "SliderGrabActive",  { 1, 1, 1, 1 } },
+    { "Header",            { 0.80, 0.82, 0.90, 0.14 } },
+    { "HeaderHovered",     { 0.80, 0.82, 0.90, 0.24 } },
+    { "HeaderActive",      { 0.80, 0.82, 0.90, 0.34 } },
+    { "PlotHistogram",     TOG_ON },
+    { "PlotHistogramHovered", TOG_ON_HOV },
     { "ScrollbarBg",       CLEAR },
     { "ScrollbarGrab",     { 0.26, 0.26, 0.28, 1.00 } },
     { "ScrollbarGrabHovered", { 0.36, 0.36, 0.38, 1.00 } },
-    { "ScrollbarGrabActive",  ACC },
-    { "TextSelectedBg",    { 0.93, 0.40, 0.08, 0.35 } },
-    { "ResizeGrip",        { 0.93, 0.40, 0.08, 0.25 } },
-    { "ResizeGripHovered", { 0.93, 0.40, 0.08, 0.60 } },
-    { "ResizeGripActive",  ACC },
+    { "ScrollbarGrabActive",  LIGHT },
+    { "TextSelectedBg",    { 0.80, 0.82, 0.90, 0.30 } },
+    { "ResizeGrip",        { 0.80, 0.82, 0.90, 0.15 } },
+    { "ResizeGripHovered", { 0.80, 0.82, 0.90, 0.40 } },
+    { "ResizeGripActive",  LIGHT },
 }
 local THEME_VARS = {                           -- numbers or { x, y }
-    { "WindowRounding",    12 },
-    { "ChildRounding",     9 },
-    { "PopupRounding",     8 },
-    { "FrameRounding",     7 },
-    { "GrabRounding",      7 },
+    { "WindowRounding",    16 },
+    { "ChildRounding",     14 },
+    { "PopupRounding",     10 },
+    { "FrameRounding",     10 },
+    { "GrabRounding",      10 },
     { "ScrollbarRounding", 8 },
     { "TabRounding",       7 },
     { "WindowBorderSize",  1 },
@@ -220,8 +223,47 @@ local function pushVar(name, v)
     return (pcall(ImGui.PushStyleVar, idx, v))
 end
 
+---------------- ANIMATION HELPERS ----------------------
+-- Smooth value follower (exponential ease). Works on wall-clock time so it
+-- is frame-rate independent. speed ~ 10-18 feels snappy.
+local ANIM, HOVER = {}, {}
+local function lerp(a, b, t) return a + (b - a) * t end
+local function mix(c1, c2, t)
+    return { lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t), lerp(c1[3], c2[3], t), lerp(c1[4], c2[4], t) }
+end
+local function animTo(key, target, speed)
+    local now = os.clock()
+    local st = ANIM[key]
+    if not st then ANIM[key] = { v = target, t = now } return target end
+    local dt = math.min(0.05, math.max(0, now - st.t))
+    st.t = now
+    st.v = st.v + (target - st.v) * (1 - math.exp(-(speed or 12) * dt))
+    if math.abs(target - st.v) < 0.002 then st.v = target end
+    return st.v
+end
+local function hoverState(key) return HOVER[key] and 1 or 0 end
+local function readHover(key)
+    local ok, h = ui("IsItemHovered")
+    HOVER[key] = ok and h == true
+end
+local function popVars(n) if n > 0 then ui("PopStyleVar", n) end end
+
+-- Window fade-in: restarts whenever the menu was hidden for a moment or a
+-- different window opens (loader -> script, minimize -> restore, ...).
+local WIN_FADE = { t0 = os.clock(), last = 0, title = "" }
+local FADE_TIME = 0.30
+local function fadeAlpha()
+    local now = os.clock()
+    if now - WIN_FADE.last > 0.25 then WIN_FADE.t0 = now end    -- was hidden: replay
+    WIN_FADE.last = now
+    local p = math.min(1, (now - WIN_FADE.t0) / FADE_TIME)
+    local e = 1 - (1 - p) * (1 - p) * (1 - p)                  -- ease-out cubic
+    return 0.02 + 0.98 * e
+end
+
 local function pushTheme()
     local nc, nv = 0, 0
+    if pushVar("Alpha", fadeAlpha()) then nv = nv + 1 end
     for _, e in ipairs(THEME_COLORS) do if pushCol(e[1], e[2]) then nc = nc + 1 end end
     for _, e in ipairs(THEME_VARS)   do if pushVar(e[1], e[2]) then nv = nv + 1 end end
     return nc, nv
@@ -275,14 +317,21 @@ end
 -- orange when ON, dark + dim text when OFF. Everything else = normal button.
 local function button(label, w, h)
     if FANCY_UI and type(label) == "string" then
-        if label:find(":%s*ON%s*$") then
-            local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+        local isOn  = label:find(":%s*ON%s*$") ~= nil
+        local isOff = (not isOn) and label:find(":%s*OFF%s*$") ~= nil
+        if isOn or isOff then
+            -- animated toggle: colour + outline ease between OFF and ON
+            local key = "tg:" .. label:gsub(":%s*O[NF]+%s*$", "")
+            local t  = animTo(key, isOn and 1 or 0, 13)
+            local hv = animTo(key .. ":h", hoverState(key), 16)
+            local base = mix(mix(FIELD, FIELD_HOV, hv), mix(TOG_ON, TOG_ON_HOV, hv), t)
+            local txt  = mix(mix(C.gray, C.white, hv * 0.6), { 0.07, 0.07, 0.09, 1 }, t)
+            local n = pushBtn(base, base, ACC_ACTIVE, txt)
+            if pushCol("Border", { LIGHT[1], LIGHT[2], LIGHT[3], 0.55 * t }) then n = n + 1 end
+            local nvar = pushVar("FrameBorderSize", t * 1.2) and 1 or 0
             local r = rawButton(label, w, h)
-            popCols(n)
-            return r
-        elseif label:find(":%s*OFF%s*$") then
-            local n = pushBtn(FIELD, FIELD_HOV, ACC_ACTIVE, C.gray)
-            local r = rawButton(label, w, h)
+            readHover(key)
+            popVars(nvar)
             popCols(n)
             return r
         end
@@ -304,7 +353,10 @@ end
 -- Big full-width START (orange) / STOP (red) button.
 local function bigButton(label, base, hover, active)
     local n = pushBtn(base or ACC, hover or ACC_HOVER, active or ACC_ACTIVE, { 1, 1, 1, 1 })
+    if not base and pushCol("Border", { LIGHT[1], LIGHT[2], LIGHT[3], 0.7 }) then n = n + 1 end
+    local nvar = (not base and pushVar("FrameBorderSize", 1.2)) and 1 or 0
     local r = sizedButton(label, -1, 40)
+    popVars(nvar)
     popCols(n)
     return r
 end
@@ -367,6 +419,7 @@ local MIN_W, MIN_H = 430, 300                   -- window can't be resized small
 local FONT_SET = false
 local function beginWindow(title, w, h, minW, minH, mini)
     CUR_TITLE = title
+    if WIN_FADE.title ~= title then WIN_FADE.title = title; WIN_FADE.t0 = os.clock() end
     minW, minH = (minW or MIN_W) * UI_SCALE, (minH or MIN_H) * UI_SCALE
     ui("SetNextWindowSize", (w or 560) * UI_SCALE, (h or 0) * UI_SCALE, 4)      -- first-use size, you can still resize
     if FANCY_UI and type(ImVec2) == "function" then
@@ -398,17 +451,16 @@ local function hsv(h, sat, v)
     elseif i == 4 then return t, p, v else return v, p, q end
 end
 local function shinyText(text, scale)
+    -- soft white shimmer that sweeps across the title (monochrome, NYXORA style)
     local t = os.clock()
     local n = #text
-    local shinePos = (t * 8) % (n + 8) - 4              -- travelling highlight
+    local shinePos = (t * 7) % (n + 10) - 5
     ui("SetWindowFontScale", (scale or 1.0) * UI_SCALE)
     for i = 1, n do
         local ch = text:sub(i, i)
-        local h = (i * 0.045 + t * 0.25) % 1
-        local r, g, b = hsv(h, 0.78, 1.0)
-        local k = math.max(0, 1 - math.abs(i - shinePos) / 2.5)   -- 0..1 shine amount
-        r, g, b = r + (1 - r) * k * 0.85, g + (1 - g) * k * 0.85, b + (1 - b) * k * 0.85
-        textColored({ r, g, b, 1 }, ch)
+        local k = math.max(0, 1 - math.abs(i - shinePos) / 3.0)
+        local v = 0.74 + 0.26 * k
+        textColored({ v, v, v + 0.02 * k, 1 }, ch)
         if i < n then ui("SameLine", 0, 0) end
     end
     ui("SetWindowFontScale", UI_SCALE)
@@ -424,7 +476,10 @@ local function drawHeader(title, withReturn, withMin)
     local _, y = ui("GetCursorPosY")
 
     local n = pushBtn(ACC, ACC, ACC, { 1, 1, 1, 1 })
-    sizedButton(" B ", 34, 34)                         -- logo tile (not clickable)
+    if pushCol("Border", { LIGHT[1], LIGHT[2], LIGHT[3], 0.45 + 0.25 * math.sin(os.clock() * 2) }) then n = n + 1 end
+    local nvar = pushVar("FrameBorderSize", 1.2) and 1 or 0
+    sizedButton(" B ", 34, 34)                         -- logo tile (not clickable, border gently pulses)
+    popVars(nvar)
     popCols(n)
 
     ui("SameLine")
@@ -459,15 +514,20 @@ local function returnButton()                  -- kept name: every module calls 
     drawHeader(CUR_TITLE, true)
 end
 
--- Sidebar nav item: centered text, orange when active, transparent when not.
+-- Sidebar nav item: transparent, glows on hover, and gets an animated white
+-- outline + filled slate background when selected.
 local function navItem(label, active, w, h)
-    local n
-    if active then
-        n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
-    else
-        n = pushBtn(CLEAR, FIELD_HOV, ACC_ACTIVE, C.white)
-    end
+    local key = "nav:" .. tostring(label)
+    local a  = animTo(key .. ":a", active and 1 or 0, 14)
+    local hv = animTo(key .. ":h", hoverState(key), 16)
+    local bg = mix(mix(CLEAR, { FIELD_HOV[1], FIELD_HOV[2], FIELD_HOV[3], 0.65 }, hv), ACC, a)
+    local txt = mix(C.gray, C.white, math.max(a, hv * 0.75))
+    local n = pushBtn(bg, bg, ACC_ACTIVE, txt)
+    if pushCol("Border", { LIGHT[1], LIGHT[2], LIGHT[3], 0.9 * a }) then n = n + 1 end
+    local nvar = pushVar("FrameBorderSize", a * 1.4) and 1 or 0
     local r = sizedButton(label, w or -1, h or 30)
+    readHover(key)
+    popVars(nvar)
     popCols(n)
     return r
 end
@@ -8028,7 +8088,10 @@ AddHook("ondraw", "script_loader_menu", function(dt)
             beginWindow("Ben Loader Script Mini", 200, 0, 140, 34, true)
             local _, my = ui("GetCursorPosY")
             local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+            if pushCol("Border", LIGHT) then n = n + 1 end
+            local nvar = pushVar("FrameBorderSize", 1) and 1 or 0
             if sizedButton(" B ", 26, 26) then loader.scriptMin = false end
+            popVars(nvar)
             popCols(n)
             ui("SameLine")
             if type(my) == "number" then ui("SetCursorPosY", my + 5) end   -- text centered with the buttons
@@ -8052,7 +8115,10 @@ AddHook("ondraw", "script_loader_menu", function(dt)
     if loader.minimized then
         beginWindow("Ben Loader Mini", 130, 0, 100, 34, true)
         local n = pushBtn(ACC, ACC_HOVER, ACC_ACTIVE, { 1, 1, 1, 1 })
+        if pushCol("Border", LIGHT) then n = n + 1 end
+        local nvar = pushVar("FrameBorderSize", 1) and 1 or 0
         if sizedButton(" B ", 26, 26) then loader.minimized = false end
+        popVars(nvar)
         popCols(n)
         ui("SameLine")
         shinyText("Ben Loader", 1.0)
@@ -8079,8 +8145,11 @@ AddHook("ondraw", "script_loader_menu", function(dt)
 
     ui("Spacing")
     -- launch button: green, so it is clearly different from the orange selection
-    local ln = pushBtn({ 0.14, 0.62, 0.34, 1 }, { 0.20, 0.74, 0.42, 1 }, { 0.10, 0.50, 0.27, 1 }, { 1, 1, 1, 1 })
+    local lh = animTo("launch:h", hoverState("launch"), 16)
+    local lbg = mix({ 0.76, 0.77, 0.81, 1 }, { 0.92, 0.93, 0.96, 1 }, lh)
+    local ln = pushBtn(lbg, lbg, { 0.66, 0.67, 0.71, 1 }, { 0.06, 0.06, 0.08, 1 })
     local go = sizedButton(">  LAUNCH  " .. string.upper(LOADER_OPTIONS[loader.selected].name), -1, 40)
+    readHover("launch")
     popCols(ln)
     if go then
         local opt = LOADER_OPTIONS[loader.selected]
